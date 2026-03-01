@@ -1,0 +1,20 @@
+#pragma kernel Main
+
+int MeshVertexCount;
+uint SourceVertsBufferStride;
+RWByteAddressBuffer sourceVerts;
+RWByteAddressBuffer outVerts;
+
+[numthreads(128,1,1)]
+void Main(uint3 id : SV_DISPATCHTHREADID)
+{
+    if(id.x  >= (uint)MeshVertexCount){
+        return;
+    }
+
+    uint address = id.x * SourceVertsBufferStride;
+
+    float3 pos = asfloat(sourceVerts.Load3(address));
+    float3 newPos = float3(pos.x, pos.y +1, pos.z);
+    outVerts.Store3(address,asuint(newPos));
+}

@@ -1,0 +1,111 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel FindNeighbors
+#pragma kernel UpdateBoids
+
+struct BoidData
+{
+    float3 position;
+    float3 velocity;
+    float3 acceleration;
+    int neighborCount;
+};
+
+RWStructuredBuffer<BoidData> boids;
+int boidCount;
+float deltaTime;
+float neighborRadius;
+
+//brute force find neighbors
+// boids have 3 main rules:
+// 1- steer clear of close neighbors
+// 2- move in the direction of average heading
+// 3- move towards average position
+
+[numthreads(256,1,1)]
+void FindNeighbors(uint3 id : SV_DISPATCHTHREADID){
+    if( id.x >= (uint)boidCount) return;
+
+    BoidData self = boids[id.x];
+
+    float3 separation = float3(0,0,0);
+    float3 alignment = float3(0,0,0);
+    float3 cohesion = float3(0,0,0);
+
+    int count = 0;
+
+    // Check EVERY other boid — O(n²)
+    for (int i = 0; i < boidCount; i++)
+    {
+        if ((uint)i == id.x) continue;  // skip self
+
+        BoidData other = boids[i];
+        float3 diff = self.position - other.position;
+        float dist = length(diff);
+
+        if (dist < neighborRadius && dist > 0.001)
+        {
+            // Separation — push away, stronger when closer
+            separation += diff / (dist * dist);
+
+            // Alignment — average velocity
+            alignment += other.velocity;
+
+            // Cohesion — average position
+            cohesion += other.position;
+
+            count++;
+        }
+    }
+
+    float3 accel = float3(0, 0, 0);
+
+    if (count > 0)
+    {
+        separation /= count;
+        alignment /= count;
+        cohesion /= count;
+
+        // Alignment: steer toward average heading
+        alignment = alignment - self.velocity;
+
+        // Cohesion: steer toward average position
+        cohesion = (cohesion - self.position);
+
+        accel = separation * 2.0
+              + alignment  * 1.0
+              + cohesion   * 1.0;
+    }
+
+    boids[id.x].acceleration = accel;
+    boids[id.x].neighborCount = count;
+}
+
+//update boid postitions
+[numthreads(256, 1, 1)]
+void UpdateBoids(uint3 id : SV_DISPATCHTHREADID)
+{
+    if (id.x >= (uint)boidCount) return;
+
+    BoidData b = boids[id.x];
+
+    b.velocity += b.acceleration * deltaTime;
+
+    // Clamp speed
+    // float speed = length(b.velocity);
+    // if (speed > 5.0)
+    //     b.velocity = (b.velocity / speed) * 5.0;
+
+    b.position += b.velocity * deltaTime;
+
+    // Wrap around bounds [-20, 20]
+    float bound = 20.0;
+    if (b.position.x > bound) b.position.x = -bound;
+    if (b.position.x < -bound) b.position.x = bound;
+    if (b.position.y > bound) b.position.y = -bound;
+    if (b.position.y < -bound) b.position.y = bound;
+    if (b.position.z > bound) b.position.z = -bound;
+    if (b.position.z < -bound) b.position.z = bound;
+
+    b.acceleration = float3(0, 0, 0);
+    boids[id.x] = b;
+}
