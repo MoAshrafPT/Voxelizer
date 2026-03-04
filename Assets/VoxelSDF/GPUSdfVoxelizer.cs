@@ -16,6 +16,9 @@ public sealed class GPUSdfVoxelizer : MonoBehaviour
     [Header("Scene Input")]
     public bool includeMeshRenderers = true;
     public bool includeSkinnedMeshRenderers = true;
+    public bool includeTerrains = true;
+    [Tooltip("Terrain heightmap sample step. 1 = full resolution, 4 = every 4th sample, etc.")]
+    [Range(1, 32)] public int terrainSampleStep = 2;
 
     [Header("JFA")]
     public bool runJFA = true;
@@ -76,6 +79,17 @@ public sealed class GPUSdfVoxelizer : MonoBehaviour
     [Range(0, 1)] public float sliceT = 0.5f;
     [Range(1, 200000)] public int voxelDrawLimit = 30000;
 
+    [Tooltip("When enabled, only draws voxels within a band around the surface (|SDF| < band) instead of all interior voxels. Essential for open surfaces like terrain.")]
+    public bool voxelSurfaceBandOnly = true;
+    [Tooltip("Max |SDF| distance (world units) for a voxel to be drawn when Surface Band Only is on.")]
+    [Min(0.001f)] public float voxelSurfaceBandWidth = 0.5f;
+
+    [Tooltip("Caps how deep below a surface interior voxels are drawn. 0 = unlimited (good for closed meshes). Useful for open surfaces like terrain.")]
+    [Min(0f)] public float maxInteriorDepth = 0f;
+
+    public Color surfaceVoxelColor = Color.cyan;
+    public Color interiorVoxelColor = new Color(0.2f, 0.4f, 1f, 1f); // blue
+
     [Header("Normals Gizmos")]
     public bool drawNormals = true;
     [Range(1, 16)] public int normalStride = 3;
@@ -83,6 +97,12 @@ public sealed class GPUSdfVoxelizer : MonoBehaviour
 
     public bool normalsOnlyNearSurface = true;
     [Min(0.0001f)] public float normalsSurfaceBand = 0.25f; // in world units (|SDF| < band)
+
+    [Header("Safety")]
+    [Tooltip("Maximum voxels per axis. Prevents runaway allocations that crash Unity.")]
+    [Range(32, 1024)] public int maxVoxelsPerAxis = 512;
+    [Tooltip("Maximum total voxel count (in millions). Build aborts if exceeded.")]
+    [Min(1)] public float maxVoxelCountMillions = 64f;
 
     [Serializable]
     private struct Tri
@@ -128,13 +148,21 @@ public sealed class GPUSdfVoxelizer : MonoBehaviour
         Dispatch3D(KClear, nx, ny, nz);
 
         voxelCS.SetBuffer(KVoxelize, "_Tris", _triBuffer);
+        // Safety cap: prevent any single triangle from looping more than this many voxels
+        // (avoids GPU TDR crash). 512^3 = ~134M would be an extreme worst case.
+        int maxItersPerTri = Mathf.Max(nx, Mathf.Max(ny, nz));
+        maxItersPerTri = maxItersPerTri * maxItersPerTri * maxItersPerTri; // cube of max dim
+        maxItersPerTri = Mathf.Min(maxItersPerTri, 2_000_000);
+        voxelCS.SetInt("_MaxItersPerTri", maxItersPerTri);
         DispatchTriangles(KVoxelize, _triCount);
 
         int ping = 0;
         if (runJFA)
         {
             int maxDim = Mathf.Max(nx, Mathf.Max(ny, nz));
-            int step = HighestPowerOfTwoAtOrBelow(maxDim) / 2;
+            // Standard JFA: starting step must be >= half the grid size.
+            // NextPowerOfTwo ensures coverage for non-power-of-two grids.
+            int step = Mathf.NextPowerOfTwo(maxDim) / 2;
             if (step < 1) step = 1;
 
             while (step >= 1)
@@ -145,6 +173,12 @@ public sealed class GPUSdfVoxelizer : MonoBehaviour
                 ping ^= 1;
                 step >>= 1;
             }
+
+            // JFA+1 correction pass — fixes edge-case errors from the main sweep
+            voxelCS.SetInt("_Step", 1);
+            voxelCS.SetInt("_PingPong", ping);
+            Dispatch3D(KJFA, nx, ny, nz);
+            ping ^= 1;
         }
 
         voxelCS.SetInt("_PingPong", ping);
@@ -187,6 +221,32 @@ public sealed class GPUSdfVoxelizer : MonoBehaviour
         gx = Mathf.Max(1, Mathf.CeilToInt(size.x / voxelSize));
         gy = Mathf.Max(1, Mathf.CeilToInt(size.y / voxelSize));
         gz = Mathf.Max(1, Mathf.CeilToInt(size.z / voxelSize));
+
+        // Clamp each axis
+        int cap = Mathf.Max(32, maxVoxelsPerAxis);
+        if (gx > cap || gy > cap || gz > cap)
+        {
+            Debug.LogWarning($"GPUSdfVoxelizer: Grid {gx}x{gy}x{gz} exceeds maxVoxelsPerAxis ({cap}). Clamping.");
+            gx = Mathf.Min(gx, cap);
+            gy = Mathf.Min(gy, cap);
+            gz = Mathf.Min(gz, cap);
+        }
+
+        // Total voxel budget check
+        long total = (long)gx * gy * gz;
+        long budget = (long)(maxVoxelCountMillions * 1_000_000);
+        if (total > budget)
+        {
+            float scale = Mathf.Pow((float)budget / total, 1f / 3f);
+            gx = Mathf.Max(1, Mathf.FloorToInt(gx * scale));
+            gy = Mathf.Max(1, Mathf.FloorToInt(gy * scale));
+            gz = Mathf.Max(1, Mathf.FloorToInt(gz * scale));
+            Debug.LogWarning($"GPUSdfVoxelizer: Total voxels exceeded {maxVoxelCountMillions}M budget. Scaled to {gx}x{gy}x{gz}.");
+        }
+
+        // Log estimated VRAM (~68 bytes per voxel across all textures)
+        float vramMB = (long)gx * gy * gz * 68f / (1024f * 1024f);
+        Debug.Log($"GPUSdfVoxelizer: Grid {gx}x{gy}x{gz} = {(long)gx * gy * gz:N0} voxels, ~{vramMB:F1} MB VRAM.");
     }
 
     private void AllocateTextures(int gx, int gy, int gz)
@@ -309,11 +369,89 @@ public sealed class GPUSdfVoxelizer : MonoBehaviour
             Destroy(baked);
         }
 
+        if (includeTerrains)
+        {
+            var terrains = FindObjectsByType<Terrain>(FindObjectsSortMode.None);
+            foreach (var terrain in terrains)
+            {
+                if (terrain == null || !terrain.isActiveAndEnabled) continue;
+                AppendTerrainTriangles(terrain, terrainSampleStep, tris);
+            }
+        }
+
         triCount = tris.Count;
         if (triCount == 0) return;
 
         _triBuffer = new ComputeBuffer(triCount, sizeof(float) * 12, ComputeBufferType.Structured);
         _triBuffer.SetData(tris);
+    }
+
+    /// <summary>
+    /// Samples a Unity Terrain's heightmap and converts it into triangles.
+    /// Terrain is an open surface (top face only, normals up). The SDF will be
+    /// positive above the terrain and negative below. Use maxInteriorDepth in
+    /// the Inspector to cap how deep the fill is drawn.
+    /// </summary>
+    private static void AppendTerrainTriangles(Terrain terrain, int step, List<Tri> outTris)
+    {
+        TerrainData td = terrain.terrainData;
+        if (td == null) return;
+
+        Vector3 terrainPos = terrain.transform.position;
+        Vector3 terrainSize = td.size; // (width, height, length)
+        int hRes = td.heightmapResolution;    // typically 513, 1025, etc.
+
+        step = Mathf.Max(1, step);
+
+        // Sample heights
+        float[,] heights = td.GetHeights(0, 0, hRes, hRes);
+
+        // Number of quads in each direction after stepping
+        int xSteps = (hRes - 1) / step;
+        int zSteps = (hRes - 1) / step;
+
+        for (int iz = 0; iz < zSteps; iz++)
+        {
+            for (int ix = 0; ix < xSteps; ix++)
+            {
+                int x0 = ix * step;
+                int x1 = Mathf.Min(x0 + step, hRes - 1);
+                int z0 = iz * step;
+                int z1 = Mathf.Min(z0 + step, hRes - 1);
+
+                // Heights array is [z, x], normalized 0-1
+                Vector3 v00 = HeightmapToWorld(x0, z0, heights[z0, x0], hRes, terrainPos, terrainSize);
+                Vector3 v10 = HeightmapToWorld(x1, z0, heights[z0, x1], hRes, terrainPos, terrainSize);
+                Vector3 v01 = HeightmapToWorld(x0, z1, heights[z1, x0], hRes, terrainPos, terrainSize);
+                Vector3 v11 = HeightmapToWorld(x1, z1, heights[z1, x1], hRes, terrainPos, terrainSize);
+
+                // CCW winding viewed from above → normals point UP (+Y)
+                AddTriIfValid(v00, v11, v10, outTris);
+                AddTriIfValid(v00, v01, v11, outTris);
+            }
+        }
+
+        Debug.Log($"GPUSdfVoxelizer: Terrain '{terrain.name}' added ~{xSteps * zSteps * 2} tris (step={step}, hRes={hRes}).");
+    }
+
+    private static Vector3 HeightmapToWorld(int x, int z, float h, int hRes, Vector3 terrainPos, Vector3 terrainSize)
+    {
+        float fx = (float)x / (hRes - 1);
+        float fz = (float)z / (hRes - 1);
+        return new Vector3(
+            terrainPos.x + fx * terrainSize.x,
+            terrainPos.y + h * terrainSize.y,
+            terrainPos.z + fz * terrainSize.z
+        );
+    }
+
+    private static void AddTriIfValid(Vector3 a, Vector3 b, Vector3 c, List<Tri> outTris)
+    {
+        Vector3 n = Vector3.Cross(b - a, c - a);
+        float len2 = n.sqrMagnitude;
+        if (len2 < 1e-20f) return;
+        n /= Mathf.Sqrt(len2);
+        outTris.Add(new Tri { a = a, b = b, c = c, n = n });
     }
 
     private static void AppendMeshTriangles(Mesh mesh, Matrix4x4 l2w, List<Tri> outTris)
@@ -510,10 +648,11 @@ public sealed class GPUSdfVoxelizer : MonoBehaviour
 
         int y = _sdfSliceYLast;
 
-        // Draw interior fill on slice (d < 0)
+        // Draw voxels on slice
+        // Surface-band mode: draw voxels where |SDF| < band  (works for open surfaces like terrain)
+        // Interior mode:     draw voxels where SDF < 0       (works for closed meshes)
         if (drawFilledInteriorSlice)
         {
-            Gizmos.color = Color.cyan;
             int drawn = 0;
 
             for (int z = 0; z < nz; z++)
@@ -521,7 +660,19 @@ public sealed class GPUSdfVoxelizer : MonoBehaviour
                 for (int x = 0; x < nx; x++)
                 {
                     float d = _sdfSliceCPU[x + nx * z];
-                    if (d >= 0f) continue;
+
+                    bool show;
+                    if (voxelSurfaceBandOnly)
+                        show = Mathf.Abs(d) < voxelSurfaceBandWidth;
+                    else if (maxInteriorDepth > 0f)
+                        show = d < 0f && d > -maxInteriorDepth;
+                    else
+                        show = d < 0f;
+                    if (!show) continue;
+
+                    // Surface voxels (near zero-crossing) vs deep interior
+                    bool isSurface = Mathf.Abs(d) < voxelSize * 1.5f;
+                    Gizmos.color = isSurface ? surfaceVoxelColor : interiorVoxelColor;
 
                     Vector3 center = gridMinWorld + new Vector3(
                         (x + 0.5f) * voxelSize,

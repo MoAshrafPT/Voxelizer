@@ -151,6 +151,9 @@ void Clear(uint3 id : SV_DispatchThreadID)
 
 // Each thread handles one triangle and writes seeds into SeedPosA / SeedNrm
 // Benign races are acceptable: many triangles can hit same voxel (last write wins).
+// _MaxItersPerTri prevents GPU hang (TDR) for huge triangles at small voxel sizes.
+int _MaxItersPerTri; // set from C# (0 = unlimited)
+
 [numthreads(64,1,1)]
 void VoxelizeTriangles(uint3 id : SV_DispatchThreadID)
 {
@@ -169,11 +172,17 @@ void VoxelizeTriangles(uint3 id : SV_DispatchThreadID)
     v0 = clamp(v0, 0, _GridSize - 1);
     v1 = clamp(v1, 0, _GridSize - 1);
 
+    // Safety: cap loop iterations to avoid GPU timeout (TDR crash)
+    int maxIter = (_MaxItersPerTri > 0) ? _MaxItersPerTri : 2000000;
+    int iters = 0;
+
     // Iterate voxels in the AABB
     for (int z = v0.z; z <= v1.z; z++)
     for (int y = v0.y; y <= v1.y; y++)
     for (int x = v0.x; x <= v1.x; x++)
     {
+        if (++iters > maxIter) return; // bail out to prevent TDR
+
         int3 v = int3(x,y,z);
         if (!VoxelIntersectsTriangle(v, tri)) continue;
 
