@@ -1,0 +1,321 @@
+#pragma kernel Clear
+#pragma kernel VoxelizeTriangles
+#pragma kernel JFA3D
+#pragma kernel ComputeSDF
+#pragma kernel ComputeNormals
+#pragma kernel ExtractSdfSlice
+#pragma kernel ExtractNormalsSlice
+// Unity HLSL include (ok even if you don't use macros)
+#include "UnityCG.cginc"
+
+struct Tri
+{
+    float3 a;
+    float3 b;
+    float3 c;
+    float3 n; // outward normal (normalized)
+};
+
+StructuredBuffer<Tri> _Tris;
+int _TriCount;
+
+int3  _GridSize;        // (Nx,Ny,Nz)
+float3 _GridMinWorld;   // world min
+float  _VoxelSize;      // world size of voxel
+
+// JFA params
+int _Step;              // jump length
+int _PingPong;          // 0 or 1 (controls read/write)
+
+// Outputs
+RWTexture3D<int4>   _SeedPosA;   // ping
+RWTexture3D<int4>   _SeedPosB;   // pong
+RWTexture3D<float4> _SeedNrm;    // normal stored at seed voxel (xyz)
+RWTexture3D<float>  _SDF;
+RWTexture3D<float4> _Normals;
+int _SliceY;
+RWTexture2D<float> _SdfSlice2D;
+RWTexture2D<float4> _NormalsSlice2D;
+
+// ---------------- Helpers ----------------
+
+bool InBounds(int3 p)
+{
+    return all(p >= 0) && all(p < _GridSize);
+}
+
+float3 VoxelCenterWorld(int3 p)
+{
+    return _GridMinWorld + (float3(p) + 0.5) * _VoxelSize;
+}
+
+int3 WorldToVoxel(float3 w)
+{
+    float3 f = (w - _GridMinWorld) / _VoxelSize;
+    return (int3)floor(f);
+}
+
+int4 ReadSeed(int3 p)
+{
+    return (_PingPong == 0) ? _SeedPosA[p] : _SeedPosB[p];
+}
+
+void WriteSeed(int3 p, int4 s)
+{
+    if (_PingPong == 0) _SeedPosB[p] = s;
+    else                _SeedPosA[p] = s;
+}
+
+float Dist2_Voxel(int3 p, int3 s)
+{
+    float3 d = (float3)p - (float3)s;
+    return dot(d, d);
+}
+
+// Closest point on triangle (Ericson-style)
+float3 ClosestPointOnTriangle(float3 p, float3 a, float3 b, float3 c)
+{
+    // Check vertex regions
+    float3 ab = b - a;
+    float3 ac = c - a;
+    float3 ap = p - a;
+
+    float d1 = dot(ab, ap);
+    float d2 = dot(ac, ap);
+    if (d1 <= 0.0 && d2 <= 0.0) return a;
+
+    float3 bp = p - b;
+    float d3 = dot(ab, bp);
+    float d4 = dot(ac, bp);
+    if (d3 >= 0.0 && d4 <= d3) return b;
+
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0)
+    {
+        float v = d1 / (d1 - d3);
+        return a + v * ab;
+    }
+
+    float3 cp = p - c;
+    float d5 = dot(ab, cp);
+    float d6 = dot(ac, cp);
+    if (d6 >= 0.0 && d5 <= d6) return c;
+
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0)
+    {
+        float w = d2 / (d2 - d6);
+        return a + w * ac;
+    }
+
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0)
+    {
+        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return b + w * (c - b);
+    }
+
+    // Inside face region
+    float denom = 1.0 / (va + vb + vc);
+    float v = vb * denom;
+    float w = vc * denom;
+    return a + ab * v + ac * w;
+}
+
+// Conservative hit: voxel intersects triangle if center is within half-diagonal of voxel from triangle
+bool VoxelIntersectsTriangle(int3 v, Tri tri)
+{
+    float3 p = VoxelCenterWorld(v);
+    float3 q = ClosestPointOnTriangle(p, tri.a, tri.b, tri.c);
+    float d2 = dot(p - q, p - q);
+
+    // Voxel half-diagonal radius
+    float r = 0.5 * _VoxelSize * 1.73205080757; // sqrt(3)
+    return d2 <= (r * r);
+}
+
+// ---------------- Kernels ----------------
+
+[numthreads(8,8,8)]
+void Clear(uint3 id : SV_DispatchThreadID)
+{
+    int3 p = (int3)id;
+    if (!InBounds(p)) return;
+
+    _SeedPosA[p] = int4(-1,-1,-1,-1);
+    _SeedPosB[p] = int4(-1,-1,-1,-1);
+    _SeedNrm[p]  = float4(0,0,0,0);
+    _SDF[p]      = 0.0;
+    _Normals[p]  = float4(0,0,0,0);
+}
+
+// Each thread handles one triangle and writes seeds into SeedPosA / SeedNrm
+// Benign races are acceptable: many triangles can hit same voxel (last write wins).
+[numthreads(64,1,1)]
+void VoxelizeTriangles(uint3 id : SV_DispatchThreadID)
+{
+    uint ti = id.x;
+    if (ti >= (uint)_TriCount) return;
+
+    Tri tri = _Tris[ti];
+
+    // Triangle AABB in world -> voxel coords
+    float3 mn = min(tri.a, min(tri.b, tri.c));
+    float3 mx = max(tri.a, max(tri.b, tri.c));
+
+    int3 v0 = WorldToVoxel(mn);
+    int3 v1 = WorldToVoxel(mx);
+
+    v0 = clamp(v0, 0, _GridSize - 1);
+    v1 = clamp(v1, 0, _GridSize - 1);
+
+    // Iterate voxels in the AABB
+    for (int z = v0.z; z <= v1.z; z++)
+    for (int y = v0.y; y <= v1.y; y++)
+    for (int x = v0.x; x <= v1.x; x++)
+    {
+        int3 v = int3(x,y,z);
+        if (!VoxelIntersectsTriangle(v, tri)) continue;
+
+        // Seed = self (surface)
+        _SeedPosA[v] = int4(v, 0);
+
+        // Store outward normal at seed voxel
+        _SeedNrm[v] = float4(tri.n, 1.0);
+    }
+}
+
+[numthreads(8,8,8)]
+void JFA3D(uint3 id : SV_DispatchThreadID)
+{
+    int3 p = (int3)id;
+    if (!InBounds(p)) return;
+
+    int4 best = ReadSeed(p);
+    float bestD = 3.402823e38;
+
+    if (best.x >= 0) bestD = Dist2_Voxel(p, best.xyz);
+
+    int k = _Step;
+
+    [unroll]
+    for (int dz = -1; dz <= 1; dz++)
+    [unroll]
+    for (int dy = -1; dy <= 1; dy++)
+    [unroll]
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        int3 q = p + int3(dx,dy,dz) * k;
+        if (!InBounds(q)) continue;
+
+        int4 cand = ReadSeed(q);
+        if (cand.x < 0) continue;
+
+        float d = Dist2_Voxel(p, cand.xyz);
+        if (d < bestD)
+        {
+            bestD = d;
+            best = cand;
+        }
+    }
+
+    WriteSeed(p, best);
+}
+
+float3 ReadSeedNormal(int3 s)
+{
+    float3 n = _SeedNrm[s].xyz;
+    float len2 = dot(n,n);
+    return (len2 > 1e-20) ? n * rsqrt(len2) : float3(0,1,0);
+}
+
+[numthreads(8,8,8)]
+void ComputeSDF(uint3 id : SV_DispatchThreadID)
+{
+    int3 p = (int3)id;
+    if (!InBounds(p)) return;
+
+    // After last JFA pass, current seed is in:
+    // if _PingPong==0 -> last write went to A (because we toggled in C#), else to B.
+    // In our C# loop, we pass final ping to this kernel, so ReadSeed(p) is correct.
+    int4 seed = ReadSeed(p);
+    if (seed.x < 0)
+    {
+        _SDF[p] = 0.0;
+        return;
+    }
+
+    int3 s = seed.xyz;
+
+    float3 pw = VoxelCenterWorld(p);
+    float3 sw = VoxelCenterWorld(s);
+
+    float unsignedDist = length(pw - sw);
+
+    // Sign from oriented seed normal
+    float3 n = ReadSeedNormal(s);
+    float side = dot(pw - sw, n);
+
+    // outside positive, inside negative
+    float signVal = (side >= 0.0) ? 1.0 : -1.0;
+
+    _SDF[p] = unsignedDist * signVal;
+}
+
+float SampleSDF(int3 p)
+{
+    p = clamp(p, 0, _GridSize - 1);
+    return _SDF[p];
+}
+
+[numthreads(8,8,8)]
+void ComputeNormals(uint3 id : SV_DispatchThreadID)
+{
+    int3 p = (int3)id;
+    if (!InBounds(p)) return;
+
+    float sx1 = SampleSDF(p + int3( 1,0,0));
+    float sx0 = SampleSDF(p + int3(-1,0,0));
+    float sy1 = SampleSDF(p + int3(0, 1,0));
+    float sy0 = SampleSDF(p + int3(0,-1,0));
+    float sz1 = SampleSDF(p + int3(0,0, 1));
+    float sz0 = SampleSDF(p + int3(0,0,-1));
+
+    float3 g = float3(sx1 - sx0, sy1 - sy0, sz1 - sz0);
+
+    float len2 = dot(g,g);
+    float3 n = (len2 > 1e-12) ? (g * rsqrt(len2)) : float3(0,1,0);
+
+    _Normals[p] = float4(n, 1.0);
+}
+
+[numthreads(8,8,1)]
+void ExtractSdfSlice(uint3 id : SV_DispatchThreadID)
+{
+    int x = (int)id.x;
+    int z = (int)id.y; // we map dispatch Y -> Z
+    int y = _SliceY;
+
+    if (x < 0 || x >= _GridSize.x) return;
+    if (z < 0 || z >= _GridSize.z) return;
+    if (y < 0 || y >= _GridSize.y) return;
+
+    float d = _SDF[int3(x, y, z)];
+    _SdfSlice2D[int2(x, z)] = d;
+}
+
+
+[numthreads(8,8,1)]
+void ExtractNormalsSlice(uint3 id : SV_DispatchThreadID)
+{
+    int x = (int)id.x;
+    int z = (int)id.y;
+    int y = _SliceY;
+
+    if (x < 0 || x >= _GridSize.x) return;
+    if (z < 0 || z >= _GridSize.z) return;
+    if (y < 0 || y >= _GridSize.y) return;
+
+    float4 n = _Normals[int3(x, y, z)];
+    _NormalsSlice2D[int2(x, z)] = n;
+}

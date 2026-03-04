@@ -1,0 +1,45 @@
+#pragma kernel BitonicSort
+
+RWStructuredBuffer<uint2> data;  // (cellID, boidIndex) — sort by cellID
+int count;
+int block;      // current block size (power of 2)
+int dimension;  // current comparison distance within block
+
+[numthreads(256, 1, 1)]
+void BitonicSort(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= (uint)count) return;
+
+    // Which pair partner to compare with
+    uint pairDistance = dimension;
+    uint blockSize = block;
+
+    // Determine sort direction: ascending or descending for this block
+    // Elements in the first half of a block sort ascending,
+    // second half sort descending (creates bitonic sequences)
+    bool ascending = ((i / blockSize) % 2) == 0;
+
+    // Find partner index
+    uint partner = i ^ pairDistance;  // XOR gives the partner
+
+    // Only the lower index in each pair does the swap (avoid double-swap)
+    if (partner > i && partner < (uint)count)
+    {
+        uint2 a = data[i];
+        uint2 b = data[partner];
+
+        // Compare by cellID (first element of uint2)
+        bool shouldSwap;
+        if (ascending)
+            shouldSwap = (a.x > b.x);
+        else
+            shouldSwap = (a.x < b.x);
+
+        if (shouldSwap)
+        {
+            data[i] = b;
+            data[partner] = a;
+        }
+    }
+}

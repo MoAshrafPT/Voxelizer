@@ -14,82 +14,163 @@ public struct BoidData
 
 }
 
+
+
 public class BoidSim : MonoBehaviour
 {
     [Header("References")]
     [SerializeField] private ComputeShader computeShader;
+    [SerializeField] private ComputeShader sortShader;
+    private GPUBitonicSort gpuSort;
     [SerializeField] private Material renderMaterial;
 
     [Header("Settings")]
-    [SerializeField] private int boidCount = 1000;
+    [SerializeField] private int boidCount = 5000;
     [SerializeField] private float neighborRadius = 3f;
+    [SerializeField] private int gridDimension = 20;  // 20×20×20 cells
 
     private GraphicsBuffer boidBuffer;
+    private GraphicsBuffer cellBoidPairsBuffer;
+    private GraphicsBuffer cellOffsetsBuffer;
+    private GraphicsBuffer cellCountsBuffer;
+
+    private int assignCellsKernel;
+    private int buildOffsetsKernel;
     private int findNeighborsKernel;
     private int updateKernel;
-    private int threadGroups;
+    private int clearOffsetsKernel;
+
+    private int boidThreadGroups;
+    private int cellThreadGroups;
+    private int totalCells;
     private Bounds bounds;
 
     void Start()
     {
+        totalCells = gridDimension * gridDimension * gridDimension;
+        float cellSize = neighborRadius;
+
+        // Find kernels
+        assignCellsKernel = computeShader.FindKernel("AssignCells");
+        buildOffsetsKernel = computeShader.FindKernel("BuildOffsets");
         findNeighborsKernel = computeShader.FindKernel("FindNeighbors");
         updateKernel = computeShader.FindKernel("UpdateBoids");
-
-        // Create buffer
+        clearOffsetsKernel = computeShader.FindKernel("ClearOffsets");
+        gpuSort = new GPUBitonicSort(sortShader);
+        // Create buffers
         boidBuffer = new GraphicsBuffer(
-            GraphicsBuffer.Target.Structured,
-            boidCount,
-            BoidData.Size
-        );
+            GraphicsBuffer.Target.Structured, boidCount, BoidData.Size);
 
-        // Initialize with random positions and velocities
+        cellBoidPairsBuffer = new GraphicsBuffer(
+            GraphicsBuffer.Target.Structured, boidCount, sizeof(uint) * 2);
+
+        cellOffsetsBuffer = new GraphicsBuffer(
+            GraphicsBuffer.Target.Structured, totalCells, sizeof(uint));
+
+        cellCountsBuffer = new GraphicsBuffer(
+            GraphicsBuffer.Target.Structured, totalCells, sizeof(uint));
+
+        // Initialize boids
         BoidData[] initial = new BoidData[boidCount];
         for (int i = 0; i < boidCount; i++)
         {
             initial[i].position = Random.insideUnitSphere * 20f;
             initial[i].velocity = Random.insideUnitSphere * 2f;
-            initial[i].acceleration = Vector3.zero;
-            initial[i].neighborCount = 0;
         }
         boidBuffer.SetData(initial);
 
-        // Bind to both kernels
-        computeShader.SetBuffer(findNeighborsKernel, "boids", boidBuffer);
-        computeShader.SetBuffer(updateKernel, "boids", boidBuffer);
+        // Clear cell data
+        cellOffsetsBuffer.SetData(new uint[totalCells]);
+        cellCountsBuffer.SetData(new uint[totalCells]);
+
+        // Bind to ALL kernels that use each buffer
+        int[] allKernels = { assignCellsKernel, buildOffsetsKernel, findNeighborsKernel, updateKernel, clearOffsetsKernel };
+        foreach (int k in allKernels)
+        {
+            computeShader.SetBuffer(k, "boids", boidBuffer);
+            computeShader.SetBuffer(k, "cellBoidPairs", cellBoidPairsBuffer);
+            computeShader.SetBuffer(k, "cellOffsets", cellOffsetsBuffer);
+            computeShader.SetBuffer(k, "cellCounts", cellCountsBuffer);
+        }
 
         // Bind to render material
         renderMaterial.SetBuffer("boids", boidBuffer);
 
-        // Constants
+        // Set constants
         computeShader.SetInt("boidCount", boidCount);
         computeShader.SetFloat("neighborRadius", neighborRadius);
+        computeShader.SetFloat("cellSize", cellSize);
+        computeShader.SetInt("gridDimension", gridDimension);
 
-        threadGroups = (boidCount + 255) / 256;
-        bounds = new Bounds(Vector3.zero, Vector3.one * 50f);
+        boidThreadGroups = (boidCount + 255) / 256;
+        cellThreadGroups = (totalCells + 255) / 256;
+        bounds = new Bounds(Vector3.zero, Vector3.one * 100f);
     }
 
     void Update()
     {
         computeShader.SetFloat("deltaTime", Time.deltaTime);
 
-        // Pass 1 — find neighbors, compute forces
-        computeShader.Dispatch(findNeighborsKernel, threadGroups, 1, 1);
+        // 1. Clear cell data from last frame
+        computeShader.Dispatch(clearOffsetsKernel, cellThreadGroups, 1, 1);
 
-        // Pass 2 — integrate velocity and position
-        computeShader.Dispatch(updateKernel, threadGroups, 1, 1);
+        // 2. Assign each boid to a cell
+        computeShader.Dispatch(assignCellsKernel, boidThreadGroups, 1, 1);
+
+        // 3. Sort cellBoidPairs by cellID
+        gpuSort.Sort(cellBoidPairsBuffer, boidCount);
+
+        // 4. Build offset table
+        computeShader.Dispatch(buildOffsetsKernel, boidThreadGroups, 1, 1);
+
+        // 5. Find neighbors using spatial hash
+        computeShader.Dispatch(findNeighborsKernel, boidThreadGroups, 1, 1);
+
+        // 6. Update positions
+        computeShader.Dispatch(updateKernel, boidThreadGroups, 1, 1);
 
         // Render
         Graphics.DrawProcedural(
-            renderMaterial,
-            bounds,
-            MeshTopology.Triangles,
-            6,
-            boidCount
-        );
+            renderMaterial, bounds, MeshTopology.Triangles, 6, boidCount);
+    }
+
+    // TEMPORARY — CPU sort until we implement GPU bitonic sort
+    // void SortOnCPU()
+    // {
+    //     uint[] pairData = new uint[boidCount * 2];
+    //     cellBoidPairsBuffer.GetData(pairData);
+
+    //     // Convert to sortable array
+    //     uint2Pair[] pairs = new uint2Pair[boidCount];
+    //     for (int i = 0; i < boidCount; i++)
+    //     {
+    //         pairs[i].cellID = pairData[i * 2];
+    //         pairs[i].boidIndex = pairData[i * 2 + 1];
+    //     }
+
+    //     // Sort by cellID
+    //     System.Array.Sort(pairs, (a, b) => a.cellID.CompareTo(b.cellID));
+
+    //     // Write back
+    //     for (int i = 0; i < boidCount; i++)
+    //     {
+    //         pairData[i * 2] = pairs[i].cellID;
+    //         pairData[i * 2 + 1] = pairs[i].boidIndex;
+    //     }
+    //     cellBoidPairsBuffer.SetData(pairData);
+    // }
+
+    struct uint2Pair
+    {
+        public uint cellID;
+        public uint boidIndex;
     }
 
     void OnDestroy()
     {
         boidBuffer?.Dispose();
+        cellBoidPairsBuffer?.Dispose();
+        cellOffsetsBuffer?.Dispose();
+        cellCountsBuffer?.Dispose();
     }
 }
