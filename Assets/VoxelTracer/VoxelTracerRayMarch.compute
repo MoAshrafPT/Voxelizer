@@ -1,0 +1,199 @@
+// ============================================================================
+// VoxelTracerRayMarch.compute
+// Full-screen DDA ray march. Normals derived from DDA step direction
+// (which voxel face the ray entered through). No normal texture needed.
+// ============================================================================
+#pragma kernel RayMarch
+
+// ---- Camera ----
+float4x4 _CamToWorld;
+float4x4 _InvProj;
+float3   _CamPos;
+float2   _ScreenSize;
+
+// ---- Volume ----
+int _Width, _Height, _Depth;
+float3 _Start;
+float  _Unit;
+
+// ---- Fill texture (read-only) ----
+Texture3D<float> _FillTex;
+
+// ---- Shading ----
+int    _VisMode;        // 0 = lit, 1 = normals
+float3 _SurfaceColor;
+float3 _LightDir;
+float3 _LightColor;
+float3 _AmbientColor;
+float4 _BackgroundColor;
+
+// ---- Output ----
+RWTexture2D<float4> _ColorOut;
+
+// ---- Limits ----
+int _MaxSteps;
+
+// ========================= Helpers =========================
+
+float2 RayAABB(float3 ro, float3 rd, float3 bmin, float3 bmax)
+{
+    float3 inv = 1.0 / rd;
+    float3 t0 = (bmin - ro) * inv;
+    float3 t1 = (bmax - ro) * inv;
+    float3 mn = min(t0, t1);
+    float3 mx = max(t0, t1);
+    return float2(max(mn.x, max(mn.y, mn.z)), min(mx.x, min(mx.y, mx.z)));
+}
+
+// ========================= Main =========================
+
+[numthreads(8, 8, 1)]
+void RayMarch(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_ScreenSize.x || id.y >= (uint)_ScreenSize.y) return;
+
+    // ---- Build ray ----
+    float2 uv  = (float2(id.xy) + 0.5) / _ScreenSize;
+    float2 ndc = uv * 2.0 - 1.0;
+
+    float4 viewPos = mul(_InvProj, float4(ndc, -1.0, 1.0));
+    viewPos.xyz /= viewPos.w;
+    float3 rd = normalize(mul((float3x3)_CamToWorld, viewPos.xyz));
+    float3 ro = _CamPos;
+
+    // Nudge zero components to avoid division by zero
+    rd.x += (abs(rd.x) < 1e-8) ? 1e-8 : 0.0;
+    rd.y += (abs(rd.y) < 1e-8) ? 1e-8 : 0.0;
+    rd.z += (abs(rd.z) < 1e-8) ? 1e-8 : 0.0;
+
+    // ---- AABB test ----
+    float3 bmin = _Start;
+    float3 bmax = _Start + float3(_Width, _Height, _Depth) * _Unit;
+    float2 tRange = RayAABB(ro, rd, bmin, bmax);
+
+    if (tRange.x > tRange.y || tRange.y < 0.0)
+    {
+        _ColorOut[id.xy] = float4(0, 0, 0, 0); // transparent — let scene show through
+        return;
+    }
+
+    // ---- DDA setup ----
+    float tStart = max(tRange.x + _Unit * 0.001, 0.0);
+    float3 entry = ro + rd * tStart;
+    float3 gridF = (entry - _Start) / _Unit;
+
+    int3 voxel = int3(floor(gridF));
+    voxel = clamp(voxel, 0, int3(_Width - 1, _Height - 1, _Depth - 1));
+
+    int3 stepDir = int3(
+        rd.x >= 0.0 ? 1 : -1,
+        rd.y >= 0.0 ? 1 : -1,
+        rd.z >= 0.0 ? 1 : -1
+    );
+
+    float3 invRd  = 1.0 / rd;
+    float3 tDelta = abs(invRd) * _Unit;
+
+    float3 nextBound;
+    nextBound.x = _Start.x + ((stepDir.x > 0) ? (voxel.x + 1) : voxel.x) * _Unit;
+    nextBound.y = _Start.y + ((stepDir.y > 0) ? (voxel.y + 1) : voxel.y) * _Unit;
+    nextBound.z = _Start.z + ((stepDir.z > 0) ? (voxel.z + 1) : voxel.z) * _Unit;
+    float3 tMax = (nextBound - ro) * invRd;
+
+    // ---- DDA traversal ----
+    bool hit = false;
+    int lastAxis = -1; // tracks which axis DDA stepped on: 0=X, 1=Y, 2=Z
+
+    for (int i = 0; i < _MaxSteps; i++)
+    {
+        if (any(voxel < 0) || any(voxel >= int3(_Width, _Height, _Depth)))
+            break;
+
+        // Load fill value directly (integer texel coordinates, mip 0)
+        float fill = _FillTex.Load(int4(voxel, 0));
+
+        if (fill > 0.5)
+        {
+            hit = true;
+            break;
+        }
+
+        // Step DDA and track which axis
+        if (tMax.x < tMax.y)
+        {
+            if (tMax.x < tMax.z)
+            {
+                voxel.x += stepDir.x;
+                tMax.x += tDelta.x;
+                lastAxis = 0;
+            }
+            else
+            {
+                voxel.z += stepDir.z;
+                tMax.z += tDelta.z;
+                lastAxis = 2;
+            }
+        }
+        else
+        {
+            if (tMax.y < tMax.z)
+            {
+                voxel.y += stepDir.y;
+                tMax.y += tDelta.y;
+                lastAxis = 1;
+            }
+            else
+            {
+                voxel.z += stepDir.z;
+                tMax.z += tDelta.z;
+                lastAxis = 2;
+            }
+        }
+    }
+
+    if (!hit)
+    {
+        _ColorOut[id.xy] = float4(0, 0, 0, 0); // transparent — let scene show through
+        return;
+    }
+
+    // ---- Compute normal from DDA face crossing ----
+    // The normal is the face of the voxel the ray entered through,
+    // pointing back toward the ray origin.
+    float3 normal;
+    if (lastAxis == 0)
+        normal = float3((float)(-stepDir.x), 0.0, 0.0);
+    else if (lastAxis == 1)
+        normal = float3(0.0, (float)(-stepDir.y), 0.0);
+    else if (lastAxis == 2)
+        normal = float3(0.0, 0.0, (float)(-stepDir.z));
+    else
+    {
+        // First voxel hit (no DDA step yet) — derive from dominant ray direction
+        float3 absRd = abs(rd);
+        if (absRd.x > absRd.y && absRd.x > absRd.z)
+            normal = float3(rd.x > 0.0 ? -1.0 : 1.0, 0.0, 0.0);
+        else if (absRd.y > absRd.z)
+            normal = float3(0.0, rd.y > 0.0 ? -1.0 : 1.0, 0.0);
+        else
+            normal = float3(0.0, 0.0, rd.z > 0.0 ? -1.0 : 1.0);
+    }
+
+    // ---- Shade ----
+    float3 color;
+
+    if (_VisMode == 1)
+    {
+        // Normal visualisation: map [-1,1] to [0,1]
+        color = normal * 0.5 + 0.5;
+    }
+    else
+    {
+        // Lit shading
+        float3 L = normalize(_LightDir);
+        float NdotL = max(0.0, dot(normal, L));
+        color = _SurfaceColor * _LightColor * NdotL + _AmbientColor;
+    }
+
+    _ColorOut[id.xy] = float4(color, 1.0);
+}

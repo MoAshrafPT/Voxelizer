@@ -1,0 +1,248 @@
+// ============================================================================
+// VoxelTracerCore.compute
+// GPU voxelization: SAT surface voxelization (atomic),
+// flood-fill volume (iterative boundary propagation),
+// buffer-to-texture conversion, gradient normals.
+// ============================================================================
+#pragma kernel Clear
+#pragma kernel Surface
+#pragma kernel SeedOutside
+#pragma kernel FloodStep
+#pragma kernel BuildTexture
+#pragma kernel ComputeNormals
+
+// ---- Grid ----
+int _Width, _Height, _Depth;
+float3 _Start;
+float  _Unit, _HalfUnit;
+
+// ---- Triangle input ----
+struct Tri { float3 a, b, c, normal; };
+StructuredBuffer<Tri> _Tris;
+int _TriCount;
+
+// ---- Voxel buffers ----
+// _VoxelBuffer: 0 = empty, 1 = surface
+// _FloodBuffer: 0 = unknown, 1 = confirmed outside
+RWStructuredBuffer<uint> _VoxelBuffer;
+RWStructuredBuffer<uint> _FloodBuffer;
+int _FillVolume; // 1 = use flood fill, 0 = surface only
+
+// ---- Output 3D textures ----
+RWTexture3D<float>  _FillTex;
+RWTexture3D<float4> _NormalTex;
+
+// ========================= Helpers =========================
+
+int VoxelIndex(int x, int y, int z)
+{
+    return z * (_Width * _Height) + y * _Width + x;
+}
+
+float3 VoxelCenter(int x, int y, int z)
+{
+    return float3(
+        _Start.x + _Unit * x + _HalfUnit,
+        _Start.y + _Unit * y + _HalfUnit,
+        _Start.z + _Unit * z + _HalfUnit
+    );
+}
+
+// SAT projection overlap test on one separating axis
+bool AxisOverlap(float3 v0, float3 v1, float3 v2, float3 ext, float3 axis)
+{
+    float p0 = dot(v0, axis);
+    float p1 = dot(v1, axis);
+    float p2 = dot(v2, axis);
+    float r  = ext.x * abs(axis.x) + ext.y * abs(axis.y) + ext.z * abs(axis.z);
+    return !((max(p0, max(p1, p2)) < -r) || (r < min(p0, min(p1, p2))));
+}
+
+// Full SAT triangle-AABB intersection (Tomas Akenine-Moller)
+bool TriAABBIntersect(float3 va, float3 vb, float3 vc, float3 center, float3 ext)
+{
+    float3 v0 = va - center;
+    float3 v1 = vb - center;
+    float3 v2 = vc - center;
+
+    float3 f0 = v1 - v0;
+    float3 f1 = v2 - v1;
+    float3 f2 = v0 - v2;
+
+    // 9 edge cross-product axes
+    if (!AxisOverlap(v0, v1, v2, ext, float3(0, -f0.z, f0.y))) return false;
+    if (!AxisOverlap(v0, v1, v2, ext, float3(0, -f1.z, f1.y))) return false;
+    if (!AxisOverlap(v0, v1, v2, ext, float3(0, -f2.z, f2.y))) return false;
+    if (!AxisOverlap(v0, v1, v2, ext, float3(f0.z, 0, -f0.x))) return false;
+    if (!AxisOverlap(v0, v1, v2, ext, float3(f1.z, 0, -f1.x))) return false;
+    if (!AxisOverlap(v0, v1, v2, ext, float3(f2.z, 0, -f2.x))) return false;
+    if (!AxisOverlap(v0, v1, v2, ext, float3(-f0.y, f0.x, 0))) return false;
+    if (!AxisOverlap(v0, v1, v2, ext, float3(-f1.y, f1.x, 0))) return false;
+    if (!AxisOverlap(v0, v1, v2, ext, float3(-f2.y, f2.x, 0))) return false;
+
+    // 3 AABB face normals (box axes)
+    if (max(v0.x, max(v1.x, v2.x)) < -ext.x || min(v0.x, min(v1.x, v2.x)) > ext.x) return false;
+    if (max(v0.y, max(v1.y, v2.y)) < -ext.y || min(v0.y, min(v1.y, v2.y)) > ext.y) return false;
+    if (max(v0.z, max(v1.z, v2.z)) < -ext.z || min(v0.z, min(v1.z, v2.z)) > ext.z) return false;
+
+    // Triangle plane
+    float3 n = cross(f0, f1);
+    float len2 = dot(n, n);
+    if (len2 < 1e-12) return false;
+    n *= rsqrt(len2);
+    float d = dot(n, va);
+    float r = ext.x * abs(n.x) + ext.y * abs(n.y) + ext.z * abs(n.z);
+    float s = dot(n, center) - d;
+    return abs(s) <= r;
+}
+
+// ========================= Kernels =========================
+
+// 0: Clear all buffers
+[numthreads(8, 8, 8)]
+void Clear(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _Width || (int)id.y >= _Height || (int)id.z >= _Depth) return;
+    int idx = VoxelIndex((int)id.x, (int)id.y, (int)id.z);
+    _VoxelBuffer[idx] = 0u;
+    _FloodBuffer[idx] = 0u;
+    _FillTex[id] = 0.0;
+    _NormalTex[id] = float4(0, 0, 0, 0);
+}
+
+// 1: Surface voxelization — all triangles, atomic write
+[numthreads(64, 1, 1)]
+void Surface(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_TriCount) return;
+
+    Tri tri = _Tris[id.x];
+
+    float3 triMin = min(tri.a, min(tri.b, tri.c));
+    float3 triMax = max(tri.a, max(tri.b, tri.c));
+
+    int3 gmin = int3(floor((triMin - _Start) / _Unit)) - 1;
+    int3 gmax = int3(floor((triMax - _Start) / _Unit)) + 1;
+    gmin = clamp(gmin, 0, int3(_Width - 1, _Height - 1, _Depth - 1));
+    gmax = clamp(gmax, 0, int3(_Width - 1, _Height - 1, _Depth - 1));
+
+    float3 ext = float3(_HalfUnit, _HalfUnit, _HalfUnit);
+
+    for (int z = gmin.z; z <= gmax.z; z++)
+    for (int y = gmin.y; y <= gmax.y; y++)
+    for (int x = gmin.x; x <= gmax.x; x++)
+    {
+        float3 center = VoxelCenter(x, y, z);
+        if (TriAABBIntersect(tri.a, tri.b, tri.c, center, ext))
+        {
+            uint dummy;
+            InterlockedOr(_VoxelBuffer[VoxelIndex(x, y, z)], 1u, dummy);
+        }
+    }
+}
+
+// 2: Seed outside — mark all non-surface boundary voxels as outside
+[numthreads(8, 8, 8)]
+void SeedOutside(uint3 id : SV_DispatchThreadID)
+{
+    int x = (int)id.x;
+    int y = (int)id.y;
+    int z = (int)id.z;
+    if (x >= _Width || y >= _Height || z >= _Depth) return;
+
+    // Only seed voxels on the faces of the grid
+    bool isBoundary = (x == 0 || x == _Width - 1 ||
+                       y == 0 || y == _Height - 1 ||
+                       z == 0 || z == _Depth - 1);
+    if (!isBoundary) return;
+
+    int idx = VoxelIndex(x, y, z);
+    // If not surface, mark as outside
+    if (_VoxelBuffer[idx] == 0u)
+        _FloodBuffer[idx] = 1u;
+}
+
+// 3: Flood step — propagate "outside" to 6-connected non-surface neighbors
+// Each dispatch propagates one layer outward. Run maxDim times for convergence.
+[numthreads(8, 8, 8)]
+void FloodStep(uint3 id : SV_DispatchThreadID)
+{
+    int x = (int)id.x;
+    int y = (int)id.y;
+    int z = (int)id.z;
+    if (x >= _Width || y >= _Height || z >= _Depth) return;
+
+    int idx = VoxelIndex(x, y, z);
+
+    // Skip if already outside or if surface
+    if (_FloodBuffer[idx] > 0u) return;
+    if (_VoxelBuffer[idx] > 0u) return;
+
+    // Check 6-connected neighbors for "outside" tag
+    bool neighborOutside = false;
+
+    if (x > 0          && _FloodBuffer[VoxelIndex(x-1, y, z)] > 0u) neighborOutside = true;
+    if (x < _Width -1  && _FloodBuffer[VoxelIndex(x+1, y, z)] > 0u) neighborOutside = true;
+    if (y > 0          && _FloodBuffer[VoxelIndex(x, y-1, z)] > 0u) neighborOutside = true;
+    if (y < _Height -1 && _FloodBuffer[VoxelIndex(x, y+1, z)] > 0u) neighborOutside = true;
+    if (z > 0          && _FloodBuffer[VoxelIndex(x, y, z-1)] > 0u) neighborOutside = true;
+    if (z < _Depth -1  && _FloodBuffer[VoxelIndex(x, y, z+1)] > 0u) neighborOutside = true;
+
+    if (neighborOutside)
+        _FloodBuffer[idx] = 1u;
+}
+
+// 4: Build fill texture
+// If _FillVolume=1: filled = surface OR interior (not-outside)
+// If _FillVolume=0: filled = surface only
+[numthreads(8, 8, 8)]
+void BuildTexture(uint3 id : SV_DispatchThreadID)
+{
+    if ((int)id.x >= _Width || (int)id.y >= _Height || (int)id.z >= _Depth) return;
+    int idx = VoxelIndex((int)id.x, (int)id.y, (int)id.z);
+    bool isSurface = _VoxelBuffer[idx] > 0u;
+
+    if (_FillVolume == 0)
+    {
+        _FillTex[id] = isSurface ? 1.0 : 0.0;
+    }
+    else
+    {
+        bool isOutside = _FloodBuffer[idx] > 0u;
+        _FillTex[id] = (isSurface || !isOutside) ? 1.0 : 0.0;
+    }
+}
+
+// 5: Compute gradient-based normals from fill texture
+[numthreads(8, 8, 8)]
+void ComputeNormals(uint3 id : SV_DispatchThreadID)
+{
+    int3 p = (int3)id;
+    if (p.x >= _Width || p.y >= _Height || p.z >= _Depth) return;
+
+    float here = _FillTex[p];
+    if (here < 0.5)
+    {
+        _NormalTex[p] = float4(0, 0, 0, 0);
+        return;
+    }
+
+    float gx = _FillTex[int3(min(p.x + 1, _Width  - 1), p.y, p.z)]
+             - _FillTex[int3(max(p.x - 1, 0),            p.y, p.z)];
+    float gy = _FillTex[int3(p.x, min(p.y + 1, _Height - 1), p.z)]
+             - _FillTex[int3(p.x, max(p.y - 1, 0),            p.z)];
+    float gz = _FillTex[int3(p.x, p.y, min(p.z + 1, _Depth - 1))]
+             - _FillTex[int3(p.x, p.y, max(p.z - 1, 0))];
+
+    float3 grad = float3(gx, gy, gz);
+    float len2 = dot(grad, grad);
+
+    if (len2 < 1e-10)
+    {
+        _NormalTex[p] = float4(0, 0, 0, 1);
+        return;
+    }
+
+    float3 n = -grad * rsqrt(len2);
+    _NormalTex[p] = float4(n, 1);
+}
