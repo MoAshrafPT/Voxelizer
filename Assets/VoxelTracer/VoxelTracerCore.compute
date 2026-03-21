@@ -12,6 +12,7 @@
 #pragma kernel ComputeNormals
 #pragma kernel CopyStaticToWorking
 #pragma kernel ClearFlood
+#pragma kernel BlurFill
 
 // ---- Grid ----
 int _Width, _Height, _Depth;
@@ -35,6 +36,7 @@ int _SweepAxis; // 0=X, 1=Y, 2=Z
 
 // ---- Output 3D textures ----
 RWTexture3D<float>  _FillTex;
+RWTexture3D<float>  _BlurredFillTex;
 RWTexture3D<float4> _NormalTex;
 
 // ========================= Helpers =========================
@@ -239,7 +241,7 @@ void BuildTexture(uint3 id : SV_DispatchThreadID)
     }
 }
 
-// 4: Compute gradient-based normals from fill texture
+// 4: Compute gradient-based normals from blurred fill texture
 [numthreads(8, 8, 8)]
 void ComputeNormals(uint3 id : SV_DispatchThreadID)
 {
@@ -253,12 +255,12 @@ void ComputeNormals(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    float gx = _FillTex[int3(min(p.x + 1, _Width  - 1), p.y, p.z)]
-             - _FillTex[int3(max(p.x - 1, 0),            p.y, p.z)];
-    float gy = _FillTex[int3(p.x, min(p.y + 1, _Height - 1), p.z)]
-             - _FillTex[int3(p.x, max(p.y - 1, 0),            p.z)];
-    float gz = _FillTex[int3(p.x, p.y, min(p.z + 1, _Depth - 1))]
-             - _FillTex[int3(p.x, p.y, max(p.z - 1, 0))];
+    float gx = _BlurredFillTex[int3(min(p.x + 1, _Width  - 1), p.y, p.z)]
+             - _BlurredFillTex[int3(max(p.x - 1, 0),            p.y, p.z)];
+    float gy = _BlurredFillTex[int3(p.x, min(p.y + 1, _Height - 1), p.z)]
+             - _BlurredFillTex[int3(p.x, max(p.y - 1, 0),            p.z)];
+    float gz = _BlurredFillTex[int3(p.x, p.y, min(p.z + 1, _Depth - 1))]
+             - _BlurredFillTex[int3(p.x, p.y, max(p.z - 1, 0))];
 
     float3 grad = float3(gx, gy, gz);
     float len2 = dot(grad, grad);
@@ -289,4 +291,23 @@ void ClearFlood(uint3 id : SV_DispatchThreadID)
     int idx = (int)id.x;
     if (idx >= _TotalVoxels) return;
     _FloodBuffer[idx] = 0u;
+}
+
+// 7: 3x3x3 box blur on _FillTex → _BlurredFillTex (for smooth normals)
+[numthreads(8, 8, 8)]
+void BlurFill(uint3 id : SV_DispatchThreadID)
+{
+    int3 p = (int3)id;
+    if (p.x >= _Width || p.y >= _Height || p.z >= _Depth) return;
+
+    float sum = 0.0;
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++)
+    {
+        int3 q = clamp(p + int3(dx, dy, dz), 0, int3(_Width - 1, _Height - 1, _Depth - 1));
+        sum += _FillTex[q];
+    }
+
+    _BlurredFillTex[p] = sum / 27.0;
 }

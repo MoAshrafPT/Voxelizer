@@ -75,7 +75,7 @@ public sealed class VoxelTracerSystem : MonoBehaviour
 
     // Kernel indices
     int KClear, KSurface, KSweepFill, KBuildTexture, KComputeNormals;
-    int KCopyStaticToWorking, KClearFlood;
+    int KCopyStaticToWorking, KClearFlood, KBlurFill;
     bool _kernelsCached;
 
     // GPU buffers
@@ -89,6 +89,7 @@ public sealed class VoxelTracerSystem : MonoBehaviour
 
     // Textures
     RenderTexture _fillTex;
+    RenderTexture _blurredFillTex;
     RenderTexture _normalsTex;
 
     // Grid state
@@ -270,8 +271,14 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         coreCS.SetTexture(KBuildTexture, "_FillTex", _fillTex);
         Dispatch3D(KBuildTexture, gx, gy, gz);
 
-        // 6) Compute normals
+        // 6) Blur fill texture for smooth normals
+        coreCS.SetTexture(KBlurFill, "_FillTex", _fillTex);
+        coreCS.SetTexture(KBlurFill, "_BlurredFillTex", _blurredFillTex);
+        Dispatch3D(KBlurFill, gx, gy, gz);
+
+        // 7) Compute normals from blurred fill
         coreCS.SetTexture(KComputeNormals, "_FillTex", _fillTex);
+        coreCS.SetTexture(KComputeNormals, "_BlurredFillTex", _blurredFillTex);
         coreCS.SetTexture(KComputeNormals, "_NormalTex", _normalsTex);
         Dispatch3D(KComputeNormals, gx, gy, gz);
     }
@@ -547,6 +554,7 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         KComputeNormals = coreCS.FindKernel("ComputeNormals");
         KCopyStaticToWorking = coreCS.FindKernel("CopyStaticToWorking");
         KClearFlood = coreCS.FindKernel("ClearFlood");
+        KBlurFill = coreCS.FindKernel("BlurFill");
         _kernelsCached = true;
     }
 
@@ -572,6 +580,18 @@ public sealed class VoxelTracerSystem : MonoBehaviour
             filterMode = FilterMode.Point
         };
         _fillTex.Create();
+
+        _blurredFillTex = new RenderTexture(gx, gy, 0, RenderTextureFormat.RFloat)
+        {
+            dimension = UnityEngine.Rendering.TextureDimension.Tex3D,
+            volumeDepth = gz,
+            enableRandomWrite = true,
+            useMipMap = false,
+            autoGenerateMips = false,
+            wrapMode = TextureWrapMode.Clamp,
+            filterMode = FilterMode.Point
+        };
+        _blurredFillTex.Create();
 
         _normalsTex = new RenderTexture(gx, gy, 0, RenderTextureFormat.ARGBFloat)
         {
@@ -627,6 +647,7 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     void ReleaseTextures()
     {
         if (_fillTex != null) { _fillTex.Release(); Destroy(_fillTex); _fillTex = null; }
+        if (_blurredFillTex != null) { _blurredFillTex.Release(); Destroy(_blurredFillTex); _blurredFillTex = null; }
         if (_normalsTex != null) { _normalsTex.Release(); Destroy(_normalsTex); _normalsTex = null; }
     }
 
