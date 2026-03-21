@@ -4,9 +4,10 @@ using System.Runtime.InteropServices;
 using UnityEngine;
 
 /// <summary>
-/// GPU voxelizer following the proven mattatz/unity-voxel architecture:
-/// StructuredBuffer voxelization, z-scan volume fill, Texture3D for ray march.
-/// Reliably detects inside/outside surface via fill flag.
+/// GPU voxelizer with static/dynamic split:
+/// - Static geometry (terrain, unmarked meshes) is voxelized once and cached on GPU.
+/// - Dynamic geometry (VoxelDynamic-tagged, skinned meshes) is re-voxelized every frame.
+/// - Per-frame cost: 1 buffer copy + dynamic SAT + sweep fill + build + normals.
 /// </summary>
 public sealed class VoxelTracerSystem : MonoBehaviour
 {
@@ -30,16 +31,14 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     [Header("Volume Fill")]
     [Tooltip("Fill interior volume between front and back surfaces")]
     public bool fillVolume = true;
+    [Tooltip("Number of sweep rounds for flood fill (1 handles most geometry, 2 for complex concavities)")]
+    [Range(1, 4)] public int fillSweepRounds = 1;
 
     [Header("Scene Input")]
     public bool includeMeshRenderers = true;
     public bool includeSkinnedMeshRenderers = true;
     public bool includeTerrains = true;
     [Range(1, 32)] public int terrainSampleStep = 4;
-
-    [Header("Dynamic")]
-    [Tooltip("When true, the full pipeline runs every frame.")]
-    public bool voxelizeEveryFrame = true;
 
     [Header("Safety")]
     [Range(32, 512)] public int maxVoxelsPerAxis = 256;
@@ -55,12 +54,6 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     struct Tri
     {
         public Vector3 a, b, c, n;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    struct Voxel_t
-    {
-        public uint fill;
     }
 
     // ================================================================
@@ -80,21 +73,37 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     // Private state
     // ================================================================
 
-    int KClear, KSurface, KSeedOutside, KFloodStep, KBuildTexture, KComputeNormals;
+    // Kernel indices
+    int KClear, KSurface, KSweepFill, KBuildTexture, KComputeNormals;
+    int KCopyStaticToWorking, KClearFlood;
     bool _kernelsCached;
 
-    ComputeBuffer _voxelBuffer;
-    ComputeBuffer _floodBuffer;
+    // GPU buffers
+    ComputeBuffer _voxelBuffer;      // working buffer (combined static + dynamic)
+    ComputeBuffer _floodBuffer;      // flood fill outside markers
+    ComputeBuffer _staticVoxelBuf;   // cached static surface voxels
+    ComputeBuffer _staticTriBuffer;  // static triangles (uploaded once)
+    ComputeBuffer _dynamicTriBuffer; // dynamic triangles (uploaded every frame)
+    int _staticTriCount;
+    int _dynamicTriCount;
+
+    // Textures
     RenderTexture _fillTex;
     RenderTexture _normalsTex;
-    ComputeBuffer _triBuffer;
-    int _triCount;
 
+    // Grid state
     int _nx, _ny, _nz;
+    int _totalVoxels;
     Vector3 _activeMin, _activeMax;
 
-    readonly List<Tri> _triList = new List<Tri>(128 * 1024);
+    // Triangle lists (CPU)
+    readonly List<Tri> _staticTriList = new List<Tri>(128 * 1024);
+    readonly List<Tri> _dynamicTriList = new List<Tri>(16 * 1024);
     Mesh _bakedMesh;
+
+    // Dirty flags
+    bool _staticDirty = true;      // rebuild static tris + re-voxelize static layer
+    bool _hasDynamicObjects;       // any dynamic objects exist in scene
 
     // ================================================================
     // Lifecycle
@@ -104,7 +113,8 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     {
         if (coreCS == null) return;
         CacheKernels();
-        Voxelize();
+        RebuildStatic();
+        VoxelizeFrame();
     }
 
     void OnDisable()
@@ -114,86 +124,185 @@ public sealed class VoxelTracerSystem : MonoBehaviour
 
     void LateUpdate()
     {
-        if (voxelizeEveryFrame && coreCS != null)
-            Voxelize();
+        if (coreCS == null) return;
+
+        if (_staticDirty)
+            RebuildStatic();
+
+        VoxelizeFrame();
     }
 
     // ================================================================
-    // Main pipeline
+    // Public API
     // ================================================================
 
+    /// <summary>Call when static geometry changes (e.g. terrain edited, static objects added/removed).</summary>
+    [ContextMenu("Rebuild Static")]
+    public void MarkStaticDirty() => _staticDirty = true;
+
+    /// <summary>Full rebuild of everything.</summary>
     [ContextMenu("Force Voxelize")]
-    public void Voxelize()
+    public void ForceRebuild()
     {
-        if (coreCS == null) return;
+        _staticDirty = true;
+        RebuildStatic();
+        VoxelizeFrame();
+    }
+
+    // ================================================================
+    // Static rebuild (runs once, or when MarkStaticDirty called)
+    // ================================================================
+
+    void RebuildStatic()
+    {
         if (!_kernelsCached) CacheKernels();
+        _staticDirty = false;
 
-        BuildTriangleList();
-        if (_triList.Count == 0) { _nx = _ny = _nz = 0; return; }
+        // Gather ALL triangles (static + dynamic) to compute bounds
+        BuildTriangleLists();
 
-        ComputeBounds(out Vector3 mn, out Vector3 mx);
+        int totalTris = _staticTriList.Count + _dynamicTriList.Count;
+        if (totalTris == 0) { _nx = _ny = _nz = 0; return; }
+
+        // Compute bounds from all geometry (static + dynamic)
+        ComputeBoundsFromBothLists(out Vector3 mn, out Vector3 mx);
         _activeMin = mn;
         _activeMax = mx;
 
         ComputeGridSize(mn, mx, out int gx, out int gy, out int gz);
-        bool sizeChanged = gx != _nx || gy != _ny || gz != _nz;
         _nx = gx; _ny = gy; _nz = gz;
+        _totalVoxels = gx * gy * gz;
 
-        if (sizeChanged || _fillTex == null)
-            AllocateResources(gx, gy, gz);
+        AllocateResources(gx, gy, gz);
 
-        UploadTriangles();
+        // Upload static triangles
+        UploadStaticTriangles();
 
-        float unit = voxelSize;
-        float hunit = unit * 0.5f;
+        if (_staticTriCount == 0)
+        {
+            // No static geometry — just clear the static voxel cache
+            ClearStaticVoxelCache();
+            return;
+        }
 
+        // Voxelize static geometry once → store in _staticVoxelBuf
+        SetGridUniforms(gx, gy, gz);
+        BindClearBuffers();
+        Dispatch3D(KClear, gx, gy, gz);
+
+        coreCS.SetBuffer(KSurface, "_VoxelBuffer", _voxelBuffer);
+        coreCS.SetBuffer(KSurface, "_Tris", _staticTriBuffer);
+        coreCS.SetInt("_TriCount", _staticTriCount);
+        DispatchLinear(KSurface, _staticTriCount);
+
+        // Copy result to static cache
+        CopyWorkingToStaticCache();
+    }
+
+    void ClearStaticVoxelCache()
+    {
+        // Fill static cache with zeros
+        var zeros = new uint[_totalVoxels];
+        _staticVoxelBuf.SetData(zeros);
+    }
+
+    void CopyWorkingToStaticCache()
+    {
+        // GPU→CPU→GPU copy via GetData/SetData for the one-time static bake
+        var data = new uint[_totalVoxels];
+        _voxelBuffer.GetData(data);
+        _staticVoxelBuf.SetData(data);
+    }
+
+    // ================================================================
+    // Per-frame voxelization (fast path)
+    // ================================================================
+
+    void VoxelizeFrame()
+    {
+        if (_nx == 0 || _fillTex == null) return;
+
+        int gx = _nx, gy = _ny, gz = _nz;
+
+        // Rebuild dynamic triangle list every frame
+        BuildDynamicTriangleList();
+        UploadDynamicTriangles();
+
+        SetGridUniforms(gx, gy, gz);
+
+        // 1) Copy cached static voxels → working buffer (fast linear kernel)
+        coreCS.SetInt("_TotalVoxels", _totalVoxels);
+        coreCS.SetBuffer(KCopyStaticToWorking, "_VoxelBuffer", _voxelBuffer);
+        coreCS.SetBuffer(KCopyStaticToWorking, "_StaticVoxelBuffer", _staticVoxelBuf);
+        DispatchLinear(KCopyStaticToWorking, _totalVoxels);
+
+        // 2) Clear flood buffer only (not voxels — we just populated them)
+        coreCS.SetBuffer(KClearFlood, "_FloodBuffer", _floodBuffer);
+        coreCS.SetInt("_TotalVoxels", _totalVoxels);
+        DispatchLinear(KClearFlood, _totalVoxels);
+
+        // 3) Surface voxelization — dynamic triangles only (atomic OR on top of static)
+        if (_dynamicTriCount > 0)
+        {
+            coreCS.SetBuffer(KSurface, "_VoxelBuffer", _voxelBuffer);
+            coreCS.SetBuffer(KSurface, "_Tris", _dynamicTriBuffer);
+            coreCS.SetInt("_TriCount", _dynamicTriCount);
+            DispatchLinear(KSurface, _dynamicTriCount);
+        }
+
+        // 4) Sweep flood fill
+        if (fillVolume)
+        {
+            coreCS.SetBuffer(KSweepFill, "_VoxelBuffer", _voxelBuffer);
+            coreCS.SetBuffer(KSweepFill, "_FloodBuffer", _floodBuffer);
+            for (int round = 0; round < fillSweepRounds; round++)
+            {
+                DispatchSweep(0, gy, gz);
+                DispatchSweep(1, gx, gz);
+                DispatchSweep(2, gx, gy);
+            }
+        }
+
+        // 5) Build fill texture
+        coreCS.SetInt("_FillVolume", fillVolume ? 1 : 0);
+        coreCS.SetBuffer(KBuildTexture, "_VoxelBuffer", _voxelBuffer);
+        coreCS.SetBuffer(KBuildTexture, "_FloodBuffer", _floodBuffer);
+        coreCS.SetTexture(KBuildTexture, "_FillTex", _fillTex);
+        Dispatch3D(KBuildTexture, gx, gy, gz);
+
+        // 6) Compute normals
+        coreCS.SetTexture(KComputeNormals, "_FillTex", _fillTex);
+        coreCS.SetTexture(KComputeNormals, "_NormalTex", _normalsTex);
+        Dispatch3D(KComputeNormals, gx, gy, gz);
+    }
+
+    void SetGridUniforms(int gx, int gy, int gz)
+    {
         coreCS.SetInt("_Width", gx);
         coreCS.SetInt("_Height", gy);
         coreCS.SetInt("_Depth", gz);
         coreCS.SetVector("_Start", _activeMin);
-        coreCS.SetFloat("_Unit", unit);
-        coreCS.SetFloat("_HalfUnit", hunit);
-        coreCS.SetInt("_TriCount", _triCount);
+        coreCS.SetFloat("_Unit", voxelSize);
+        coreCS.SetFloat("_HalfUnit", voxelSize * 0.5f);
+    }
 
-        BindResources();
-
-        // 1) Clear voxel buffer and fill texture
-        Dispatch3D(KClear, gx, gy, gz);
-
-        // 2) Surface voxelization — all triangles (atomic)
-        coreCS.SetBuffer(KSurface, "_Tris", _triBuffer);
-        DispatchLinear(KSurface, _triCount);
-
-        // 3) Flood-fill volume (optional)
-        if (fillVolume)
-        {
-            // Seed boundary voxels as "outside"
-            Dispatch3D(KSeedOutside, gx, gy, gz);
-
-            // Fixed iteration flood: max dimension guarantees convergence
-            // Each pass propagates at least 1 layer outward from boundary
-            int maxDim = Mathf.Max(gx, Mathf.Max(gy, gz));
-            for (int iter = 0; iter < maxDim; iter++)
-                Dispatch3D(KFloodStep, gx, gy, gz);
-        }
-
-        // 4) Build fill texture from voxel buffer + flood buffer
-        coreCS.SetInt("_FillVolume", fillVolume ? 1 : 0);
-        Dispatch3D(KBuildTexture, gx, gy, gz);
-
-        // 5) Compute gradient normals from filled volume
-        coreCS.SetTexture(KComputeNormals, "_FillTex", _fillTex);
-        coreCS.SetTexture(KComputeNormals, "_NormalTex", _normalsTex);
-        Dispatch3D(KComputeNormals, gx, gy, gz);
+    void BindClearBuffers()
+    {
+        coreCS.SetBuffer(KClear, "_VoxelBuffer", _voxelBuffer);
+        coreCS.SetBuffer(KClear, "_FloodBuffer", _floodBuffer);
+        coreCS.SetTexture(KClear, "_FillTex", _fillTex);
+        coreCS.SetTexture(KClear, "_NormalTex", _normalsTex);
     }
 
     // ================================================================
     // Triangle extraction (CPU)
     // ================================================================
 
-    void BuildTriangleList()
+    void BuildTriangleLists()
     {
-        _triList.Clear();
+        _staticTriList.Clear();
+        _dynamicTriList.Clear();
+        _hasDynamicObjects = false;
 
         if (includeMeshRenderers)
         {
@@ -204,7 +313,17 @@ public sealed class VoxelTracerSystem : MonoBehaviour
                 var mr = mf.GetComponent<MeshRenderer>();
                 if (mr == null || !mr.enabled) continue;
                 if (mf.sharedMesh == null) continue;
-                AppendMesh(mf.sharedMesh, mf.transform.localToWorldMatrix);
+
+                bool isDynamic = mf.GetComponent<VoxelDynamic>() != null;
+                if (isDynamic)
+                {
+                    AppendMesh(mf.sharedMesh, mf.transform.localToWorldMatrix, _dynamicTriList);
+                    _hasDynamicObjects = true;
+                }
+                else
+                {
+                    AppendMesh(mf.sharedMesh, mf.transform.localToWorldMatrix, _staticTriList);
+                }
             }
         }
 
@@ -217,7 +336,8 @@ public sealed class VoxelTracerSystem : MonoBehaviour
                 if (smr == null || !smr.enabled || !smr.gameObject.activeInHierarchy) continue;
                 _bakedMesh.Clear();
                 try { smr.BakeMesh(_bakedMesh); } catch { continue; }
-                AppendMesh(_bakedMesh, smr.transform.localToWorldMatrix);
+                AppendMesh(_bakedMesh, smr.transform.localToWorldMatrix, _dynamicTriList);
+                _hasDynamicObjects = true;
             }
         }
 
@@ -227,12 +347,45 @@ public sealed class VoxelTracerSystem : MonoBehaviour
             foreach (var t in terrains)
             {
                 if (t == null || !t.isActiveAndEnabled) continue;
-                AppendTerrain(t, terrainSampleStep);
+                AppendTerrain(t, terrainSampleStep, _staticTriList);
             }
         }
     }
 
-    void AppendMesh(Mesh mesh, Matrix4x4 l2w)
+    /// <summary>Lightweight per-frame rebuild of dynamic triangles only.</summary>
+    void BuildDynamicTriangleList()
+    {
+        _dynamicTriList.Clear();
+
+        if (includeMeshRenderers)
+        {
+            var dynamics = FindObjectsByType<VoxelDynamic>(FindObjectsSortMode.None);
+            foreach (var vd in dynamics)
+            {
+                if (vd == null || !vd.gameObject.activeInHierarchy) continue;
+                var mf = vd.GetComponent<MeshFilter>();
+                if (mf == null || mf.sharedMesh == null) continue;
+                var mr = vd.GetComponent<MeshRenderer>();
+                if (mr == null || !mr.enabled) continue;
+                AppendMesh(mf.sharedMesh, mf.transform.localToWorldMatrix, _dynamicTriList);
+            }
+        }
+
+        if (includeSkinnedMeshRenderers)
+        {
+            if (_bakedMesh == null) _bakedMesh = new Mesh();
+            var skins = FindObjectsByType<SkinnedMeshRenderer>(FindObjectsSortMode.None);
+            foreach (var smr in skins)
+            {
+                if (smr == null || !smr.enabled || !smr.gameObject.activeInHierarchy) continue;
+                _bakedMesh.Clear();
+                try { smr.BakeMesh(_bakedMesh); } catch { continue; }
+                AppendMesh(_bakedMesh, smr.transform.localToWorldMatrix, _dynamicTriList);
+            }
+        }
+    }
+
+    void AppendMesh(Mesh mesh, Matrix4x4 l2w, List<Tri> target)
     {
         var verts = mesh.vertices;
         var tris = mesh.triangles;
@@ -254,11 +407,11 @@ public sealed class VoxelTracerSystem : MonoBehaviour
             if (len2 < 1e-20f) continue;
             n /= Mathf.Sqrt(len2);
 
-            _triList.Add(new Tri { a = a, b = b, c = c, n = n });
+            target.Add(new Tri { a = a, b = b, c = c, n = n });
         }
     }
 
-    void AppendTerrain(Terrain terrain, int step)
+    void AppendTerrain(Terrain terrain, int step, List<Tri> target)
     {
         var td = terrain.terrainData;
         if (td == null) return;
@@ -287,42 +440,16 @@ public sealed class VoxelTracerSystem : MonoBehaviour
                 Vector3 v11 = HToW(x1, z1, heights[z1, x1], hRes, tPos, tSize);
 
                 // Top surface (heightmap)
-                AddTri(v00, v11, v10);
-                AddTri(v00, v01, v11);
+                AddTri(v00, v11, v10, target);
+                AddTri(v00, v01, v11, target);
 
                 // Bottom surface (flat at terrain base Y, reversed winding)
                 Vector3 b00 = new Vector3(v00.x, bottomY, v00.z);
                 Vector3 b10 = new Vector3(v10.x, bottomY, v10.z);
                 Vector3 b01 = new Vector3(v01.x, bottomY, v01.z);
                 Vector3 b11 = new Vector3(v11.x, bottomY, v11.z);
-                AddTri(b00, b10, b11);
-                AddTri(b00, b11, b01);
-
-                // Side walls along terrain edges (connect top heightmap to bottom)
-                // Left edge (ix == 0)
-                if (ix == 0)
-                {
-                    AddTri(v00, b00, b01);
-                    AddTri(v00, b01, v01);
-                }
-                // Right edge (ix == xSteps - 1)
-                if (ix == xSteps - 1)
-                {
-                    AddTri(v10, v11, b11);
-                    AddTri(v10, b11, b10);
-                }
-                // Front edge (iz == 0)
-                if (iz == 0)
-                {
-                    AddTri(v00, v10, b10);
-                    AddTri(v00, b10, b00);
-                }
-                // Back edge (iz == zSteps - 1)
-                if (iz == zSteps - 1)
-                {
-                    AddTri(v01, b01, b11);
-                    AddTri(v01, b11, v11);
-                }
+                AddTri(b00, b10, b11, target);
+                AddTri(b00, b11, b01, target);
             }
     }
 
@@ -335,20 +462,20 @@ public sealed class VoxelTracerSystem : MonoBehaviour
                            tPos.z + fz * tSize.z);
     }
 
-    void AddTri(Vector3 a, Vector3 b, Vector3 c)
+    void AddTri(Vector3 a, Vector3 b, Vector3 c, List<Tri> target)
     {
         Vector3 n = Vector3.Cross(b - a, c - a);
         float len2 = n.sqrMagnitude;
         if (len2 < 1e-20f) return;
         n /= Mathf.Sqrt(len2);
-        _triList.Add(new Tri { a = a, b = b, c = c, n = n });
+        target.Add(new Tri { a = a, b = b, c = c, n = n });
     }
 
     // ================================================================
     // Bounds
     // ================================================================
 
-    void ComputeBounds(out Vector3 mn, out Vector3 mx)
+    void ComputeBoundsFromBothLists(out Vector3 mn, out Vector3 mx)
     {
         if (boundsMode == BoundsMode.Manual)
         {
@@ -360,18 +487,24 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         mn = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
         mx = new Vector3(float.MinValue, float.MinValue, float.MinValue);
 
-        for (int i = 0; i < _triList.Count; i++)
-        {
-            var t = _triList[i];
-            mn = Vector3.Min(mn, Vector3.Min(t.a, Vector3.Min(t.b, t.c)));
-            mx = Vector3.Max(mx, Vector3.Max(t.a, Vector3.Max(t.b, t.c)));
-        }
+        ExpandBounds(_staticTriList, ref mn, ref mx);
+        ExpandBounds(_dynamicTriList, ref mn, ref mx);
 
         if (mn.x > mx.x) { mn = gridMin; mx = gridMax; return; }
 
         Vector3 pad = Vector3.one * autoFitPadding;
         mn -= pad;
         mx += pad;
+    }
+
+    static void ExpandBounds(List<Tri> list, ref Vector3 mn, ref Vector3 mx)
+    {
+        for (int i = 0; i < list.Count; i++)
+        {
+            var t = list[i];
+            mn = Vector3.Min(mn, Vector3.Min(t.a, Vector3.Min(t.b, t.c)));
+            mx = Vector3.Max(mx, Vector3.Max(t.a, Vector3.Max(t.b, t.c)));
+        }
     }
 
     // ================================================================
@@ -409,21 +542,24 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     {
         KClear = coreCS.FindKernel("Clear");
         KSurface = coreCS.FindKernel("Surface");
-        KSeedOutside = coreCS.FindKernel("SeedOutside");
-        KFloodStep = coreCS.FindKernel("FloodStep");
+        KSweepFill = coreCS.FindKernel("SweepFill");
         KBuildTexture = coreCS.FindKernel("BuildTexture");
         KComputeNormals = coreCS.FindKernel("ComputeNormals");
+        KCopyStaticToWorking = coreCS.FindKernel("CopyStaticToWorking");
+        KClearFlood = coreCS.FindKernel("ClearFlood");
         _kernelsCached = true;
     }
 
     void AllocateResources(int gx, int gy, int gz)
     {
-        ReleaseVoxelBuffer();
+        ReleaseBuffers();
         ReleaseTextures();
 
         int totalVoxels = gx * gy * gz;
+        _totalVoxels = totalVoxels;
         _voxelBuffer = new ComputeBuffer(totalVoxels, sizeof(uint));
         _floodBuffer = new ComputeBuffer(totalVoxels, sizeof(uint));
+        _staticVoxelBuf = new ComputeBuffer(totalVoxels, sizeof(uint));
 
         _fillTex = new RenderTexture(gx, gy, 0, RenderTextureFormat.RFloat)
         {
@@ -450,43 +586,42 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         _normalsTex.Create();
     }
 
-    void BindResources()
+    void UploadStaticTriangles()
     {
-        coreCS.SetBuffer(KClear, "_VoxelBuffer", _voxelBuffer);
-        coreCS.SetBuffer(KClear, "_FloodBuffer", _floodBuffer);
-        coreCS.SetBuffer(KSurface, "_VoxelBuffer", _voxelBuffer);
-        coreCS.SetBuffer(KSeedOutside, "_VoxelBuffer", _voxelBuffer);
-        coreCS.SetBuffer(KSeedOutside, "_FloodBuffer", _floodBuffer);
-        coreCS.SetBuffer(KFloodStep, "_VoxelBuffer", _voxelBuffer);
-        coreCS.SetBuffer(KFloodStep, "_FloodBuffer", _floodBuffer);
-        coreCS.SetBuffer(KBuildTexture, "_VoxelBuffer", _voxelBuffer);
-        coreCS.SetBuffer(KBuildTexture, "_FloodBuffer", _floodBuffer);
+        _staticTriCount = _staticTriList.Count;
+        if (_staticTriCount == 0) return;
 
-        coreCS.SetTexture(KClear, "_FillTex", _fillTex);
-        coreCS.SetTexture(KClear, "_NormalTex", _normalsTex);
-        coreCS.SetTexture(KBuildTexture, "_FillTex", _fillTex);
+        if (_staticTriBuffer != null && _staticTriBuffer.count != _staticTriCount)
+        { _staticTriBuffer.Release(); _staticTriBuffer = null; }
+        if (_staticTriBuffer == null)
+            _staticTriBuffer = new ComputeBuffer(_staticTriCount, Marshal.SizeOf(typeof(Tri)));
+
+        _staticTriBuffer.SetData(_staticTriList);
     }
 
-    void UploadTriangles()
+    void UploadDynamicTriangles()
     {
-        _triCount = _triList.Count;
-        if (_triCount == 0) return;
-
-        if (_triBuffer != null && _triBuffer.count != _triCount)
+        _dynamicTriCount = _dynamicTriList.Count;
+        if (_dynamicTriCount == 0)
         {
-            _triBuffer.Release();
-            _triBuffer = null;
+            // Release to save memory when no dynamic objects
+            if (_dynamicTriBuffer != null) { _dynamicTriBuffer.Release(); _dynamicTriBuffer = null; }
+            return;
         }
-        if (_triBuffer == null)
-            _triBuffer = new ComputeBuffer(_triCount, Marshal.SizeOf(typeof(Tri)));
 
-        _triBuffer.SetData(_triList);
+        if (_dynamicTriBuffer != null && _dynamicTriBuffer.count < _dynamicTriCount)
+        { _dynamicTriBuffer.Release(); _dynamicTriBuffer = null; }
+        if (_dynamicTriBuffer == null)
+            _dynamicTriBuffer = new ComputeBuffer(_dynamicTriCount, Marshal.SizeOf(typeof(Tri)));
+
+        _dynamicTriBuffer.SetData(_dynamicTriList);
     }
 
-    void ReleaseVoxelBuffer()
+    void ReleaseBuffers()
     {
         if (_voxelBuffer != null) { _voxelBuffer.Release(); _voxelBuffer = null; }
         if (_floodBuffer != null) { _floodBuffer.Release(); _floodBuffer = null; }
+        if (_staticVoxelBuf != null) { _staticVoxelBuf.Release(); _staticVoxelBuf = null; }
     }
 
     void ReleaseTextures()
@@ -495,17 +630,19 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         if (_normalsTex != null) { _normalsTex.Release(); Destroy(_normalsTex); _normalsTex = null; }
     }
 
-    void ReleaseTriBuffer()
+    void ReleaseTriBuffers()
     {
-        if (_triBuffer != null) { _triBuffer.Release(); _triBuffer = null; }
-        _triCount = 0;
+        if (_staticTriBuffer != null) { _staticTriBuffer.Release(); _staticTriBuffer = null; }
+        if (_dynamicTriBuffer != null) { _dynamicTriBuffer.Release(); _dynamicTriBuffer = null; }
+        _staticTriCount = 0;
+        _dynamicTriCount = 0;
     }
 
     void ReleaseAll()
     {
-        ReleaseVoxelBuffer();
+        ReleaseBuffers();
         ReleaseTextures();
-        ReleaseTriBuffer();
+        ReleaseTriBuffers();
         if (_bakedMesh != null) { Destroy(_bakedMesh); _bakedMesh = null; }
     }
 
@@ -529,6 +666,12 @@ public sealed class VoxelTracerSystem : MonoBehaviour
             Mathf.CeilToInt(gx / (float)tx),
             Mathf.CeilToInt(gy / (float)ty),
             1);
+    }
+
+    void DispatchSweep(int axis, int planeA, int planeB)
+    {
+        coreCS.SetInt("_SweepAxis", axis);
+        Dispatch2D(KSweepFill, planeA, planeB);
     }
 
     void DispatchLinear(int kernel, int count)

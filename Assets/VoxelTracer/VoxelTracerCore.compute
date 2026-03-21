@@ -1,15 +1,17 @@
 // ============================================================================
 // VoxelTracerCore.compute
 // GPU voxelization: SAT surface voxelization (atomic),
-// flood-fill volume (iterative boundary propagation),
+// axis-sweep flood fill (6 directions × N rounds),
 // buffer-to-texture conversion, gradient normals.
+// Static/dynamic split: static voxels cached, dynamic voxels per-frame.
 // ============================================================================
 #pragma kernel Clear
 #pragma kernel Surface
-#pragma kernel SeedOutside
-#pragma kernel FloodStep
+#pragma kernel SweepFill
 #pragma kernel BuildTexture
 #pragma kernel ComputeNormals
+#pragma kernel CopyStaticToWorking
+#pragma kernel ClearFlood
 
 // ---- Grid ----
 int _Width, _Height, _Depth;
@@ -22,11 +24,14 @@ StructuredBuffer<Tri> _Tris;
 int _TriCount;
 
 // ---- Voxel buffers ----
-// _VoxelBuffer: 0 = empty, 1 = surface
-// _FloodBuffer: 0 = unknown, 1 = confirmed outside
-RWStructuredBuffer<uint> _VoxelBuffer;
-RWStructuredBuffer<uint> _FloodBuffer;
+RWStructuredBuffer<uint> _VoxelBuffer;  // working buffer: combined surface
+RWStructuredBuffer<uint> _FloodBuffer;  // 0 = unknown, 1 = confirmed outside
+StructuredBuffer<uint>   _StaticVoxelBuffer; // cached static surface (read-only)
 int _FillVolume; // 1 = use flood fill, 0 = surface only
+int _TotalVoxels; // Width * Height * Depth (for linear dispatches)
+
+// ---- Sweep parameters ----
+int _SweepAxis; // 0=X, 1=Y, 2=Z
 
 // ---- Output 3D textures ----
 RWTexture3D<float>  _FillTex;
@@ -69,7 +74,6 @@ bool TriAABBIntersect(float3 va, float3 vb, float3 vc, float3 center, float3 ext
     float3 f1 = v2 - v1;
     float3 f2 = v0 - v2;
 
-    // 9 edge cross-product axes
     if (!AxisOverlap(v0, v1, v2, ext, float3(0, -f0.z, f0.y))) return false;
     if (!AxisOverlap(v0, v1, v2, ext, float3(0, -f1.z, f1.y))) return false;
     if (!AxisOverlap(v0, v1, v2, ext, float3(0, -f2.z, f2.y))) return false;
@@ -80,12 +84,10 @@ bool TriAABBIntersect(float3 va, float3 vb, float3 vc, float3 center, float3 ext
     if (!AxisOverlap(v0, v1, v2, ext, float3(-f1.y, f1.x, 0))) return false;
     if (!AxisOverlap(v0, v1, v2, ext, float3(-f2.y, f2.x, 0))) return false;
 
-    // 3 AABB face normals (box axes)
     if (max(v0.x, max(v1.x, v2.x)) < -ext.x || min(v0.x, min(v1.x, v2.x)) > ext.x) return false;
     if (max(v0.y, max(v1.y, v2.y)) < -ext.y || min(v0.y, min(v1.y, v2.y)) > ext.y) return false;
     if (max(v0.z, max(v1.z, v2.z)) < -ext.z || min(v0.z, min(v1.z, v2.z)) > ext.z) return false;
 
-    // Triangle plane
     float3 n = cross(f0, f1);
     float len2 = dot(n, n);
     if (len2 < 1e-12) return false;
@@ -141,66 +143,89 @@ void Surface(uint3 id : SV_DispatchThreadID)
     }
 }
 
-// 2: Seed outside — mark all non-surface boundary voxels as outside
-[numthreads(8, 8, 8)]
-void SeedOutside(uint3 id : SV_DispatchThreadID)
+// 2: Axis-sweep flood fill (both directions per axis in one dispatch)
+// Dispatched over a 2D plane perpendicular to _SweepAxis.
+// Each thread sweeps one line forward then backward,
+// propagating "outside" from both boundary faces, stopping at surfaces.
+[numthreads(8, 8, 1)]
+void SweepFill(uint3 id : SV_DispatchThreadID)
 {
-    int x = (int)id.x;
-    int y = (int)id.y;
-    int z = (int)id.z;
-    if (x >= _Width || y >= _Height || z >= _Depth) return;
+    int a = (int)id.x;
+    int b = (int)id.y;
 
-    // Only seed voxels on the faces of the grid
-    bool isBoundary = (x == 0 || x == _Width - 1 ||
-                       y == 0 || y == _Height - 1 ||
-                       z == 0 || z == _Depth - 1);
-    if (!isBoundary) return;
+    int dimA, dimB, dimSweep;
+    if (_SweepAxis == 0)      { dimA = _Height; dimB = _Depth;  dimSweep = _Width;  }
+    else if (_SweepAxis == 1) { dimA = _Width;  dimB = _Depth;  dimSweep = _Height; }
+    else                      { dimA = _Width;  dimB = _Height; dimSweep = _Depth;  }
 
-    int idx = VoxelIndex(x, y, z);
-    // If not surface, mark as outside
-    if (_VoxelBuffer[idx] == 0u)
-        _FloodBuffer[idx] = 1u;
+    if (a >= dimA || b >= dimB) return;
+
+    // Forward sweep (+ direction)
+    bool propagating = true;
+    for (int s = 0; s < dimSweep; s++)
+    {
+        int x, y, z;
+        if (_SweepAxis == 0)      { x = s; y = a; z = b; }
+        else if (_SweepAxis == 1) { x = a; y = s; z = b; }
+        else                      { x = a; y = b; z = s; }
+
+        int idx = VoxelIndex(x, y, z);
+
+        if (_VoxelBuffer[idx] > 0u)
+        {
+            propagating = false;
+            continue;
+        }
+
+        if (propagating || _FloodBuffer[idx] > 0u)
+        {
+            _FloodBuffer[idx] = 1u;
+            propagating = true;
+        }
+        else
+        {
+            propagating = false;
+        }
+    }
+
+    // Backward sweep (- direction)
+    propagating = true;
+    for (int s = dimSweep - 1; s >= 0; s--)
+    {
+        int x, y, z;
+        if (_SweepAxis == 0)      { x = s; y = a; z = b; }
+        else if (_SweepAxis == 1) { x = a; y = s; z = b; }
+        else                      { x = a; y = b; z = s; }
+
+        int idx = VoxelIndex(x, y, z);
+
+        if (_VoxelBuffer[idx] > 0u)
+        {
+            propagating = false;
+            continue;
+        }
+
+        if (propagating || _FloodBuffer[idx] > 0u)
+        {
+            _FloodBuffer[idx] = 1u;
+            propagating = true;
+        }
+        else
+        {
+            propagating = false;
+        }
+    }
 }
 
-// 3: Flood step — propagate "outside" to 6-connected non-surface neighbors
-// Each dispatch propagates one layer outward. Run maxDim times for convergence.
-[numthreads(8, 8, 8)]
-void FloodStep(uint3 id : SV_DispatchThreadID)
-{
-    int x = (int)id.x;
-    int y = (int)id.y;
-    int z = (int)id.z;
-    if (x >= _Width || y >= _Height || z >= _Depth) return;
-
-    int idx = VoxelIndex(x, y, z);
-
-    // Skip if already outside or if surface
-    if (_FloodBuffer[idx] > 0u) return;
-    if (_VoxelBuffer[idx] > 0u) return;
-
-    // Check 6-connected neighbors for "outside" tag
-    bool neighborOutside = false;
-
-    if (x > 0          && _FloodBuffer[VoxelIndex(x-1, y, z)] > 0u) neighborOutside = true;
-    if (x < _Width -1  && _FloodBuffer[VoxelIndex(x+1, y, z)] > 0u) neighborOutside = true;
-    if (y > 0          && _FloodBuffer[VoxelIndex(x, y-1, z)] > 0u) neighborOutside = true;
-    if (y < _Height -1 && _FloodBuffer[VoxelIndex(x, y+1, z)] > 0u) neighborOutside = true;
-    if (z > 0          && _FloodBuffer[VoxelIndex(x, y, z-1)] > 0u) neighborOutside = true;
-    if (z < _Depth -1  && _FloodBuffer[VoxelIndex(x, y, z+1)] > 0u) neighborOutside = true;
-
-    if (neighborOutside)
-        _FloodBuffer[idx] = 1u;
-}
-
-// 4: Build fill texture
-// If _FillVolume=1: filled = surface OR interior (not-outside)
-// If _FillVolume=0: filled = surface only
+// 3: Build fill texture
+// filled = surface OR (not-outside when fill enabled)
 [numthreads(8, 8, 8)]
 void BuildTexture(uint3 id : SV_DispatchThreadID)
 {
     if ((int)id.x >= _Width || (int)id.y >= _Height || (int)id.z >= _Depth) return;
     int idx = VoxelIndex((int)id.x, (int)id.y, (int)id.z);
-    bool isSurface = _VoxelBuffer[idx] > 0u;
+    uint surfVal = _VoxelBuffer[idx];
+    bool isSurface = surfVal > 0u;
 
     if (_FillVolume == 0)
     {
@@ -209,11 +234,12 @@ void BuildTexture(uint3 id : SV_DispatchThreadID)
     else
     {
         bool isOutside = _FloodBuffer[idx] > 0u;
-        _FillTex[id] = (isSurface || !isOutside) ? 1.0 : 0.0;
+        // Filled = surface voxels + interior (not surface, not outside)
+        _FillTex[id] = (!isOutside || isSurface) ? 1.0 : 0.0;
     }
 }
 
-// 5: Compute gradient-based normals from fill texture
+// 4: Compute gradient-based normals from fill texture
 [numthreads(8, 8, 8)]
 void ComputeNormals(uint3 id : SV_DispatchThreadID)
 {
@@ -245,4 +271,22 @@ void ComputeNormals(uint3 id : SV_DispatchThreadID)
 
     float3 n = -grad * rsqrt(len2);
     _NormalTex[p] = float4(n, 1);
+}
+
+// 5: Copy cached static voxels into working buffer (linear dispatch)
+[numthreads(256, 1, 1)]
+void CopyStaticToWorking(uint3 id : SV_DispatchThreadID)
+{
+    int idx = (int)id.x;
+    if (idx >= _TotalVoxels) return;
+    _VoxelBuffer[idx] = _StaticVoxelBuffer[idx];
+}
+
+// 6: Clear flood buffer only (linear dispatch, avoids clearing voxels + textures)
+[numthreads(256, 1, 1)]
+void ClearFlood(uint3 id : SV_DispatchThreadID)
+{
+    int idx = (int)id.x;
+    if (idx >= _TotalVoxels) return;
+    _FloodBuffer[idx] = 0u;
 }
