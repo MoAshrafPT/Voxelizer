@@ -458,6 +458,60 @@ public sealed class VoxelTracerSystem : MonoBehaviour
                 AddTri(b00, b10, b11, target);
                 AddTri(b00, b11, b01, target);
             }
+
+        // Side-wall skirts to seal the mesh when edges are raised.
+        // Without these, the sweep fill leaks through the gap between
+        // the top heightmap edge and the flat bottom surface.
+
+        // Z-min edge (iz == 0, front face, winding faces outward -Z)
+        for (int ix = 0; ix < xSteps; ix++)
+        {
+            int x0 = ix * step, x1 = Mathf.Min(x0 + step, hRes - 1);
+            Vector3 top0 = HToW(x0, 0, heights[0, x0], hRes, tPos, tSize);
+            Vector3 top1 = HToW(x1, 0, heights[0, x1], hRes, tPos, tSize);
+            Vector3 bot0 = new Vector3(top0.x, bottomY, top0.z);
+            Vector3 bot1 = new Vector3(top1.x, bottomY, top1.z);
+            AddTri(top0, top1, bot1, target);
+            AddTri(top0, bot1, bot0, target);
+        }
+
+        // Z-max edge (iz == zSteps, back face, winding faces outward +Z)
+        for (int ix = 0; ix < xSteps; ix++)
+        {
+            int x0 = ix * step, x1 = Mathf.Min(x0 + step, hRes - 1);
+            int z = Mathf.Min(zSteps * step, hRes - 1);
+            Vector3 top0 = HToW(x0, z, heights[z, x0], hRes, tPos, tSize);
+            Vector3 top1 = HToW(x1, z, heights[z, x1], hRes, tPos, tSize);
+            Vector3 bot0 = new Vector3(top0.x, bottomY, top0.z);
+            Vector3 bot1 = new Vector3(top1.x, bottomY, top1.z);
+            AddTri(top0, bot1, top1, target);
+            AddTri(top0, bot0, bot1, target);
+        }
+
+        // X-min edge (ix == 0, left face, winding faces outward -X)
+        for (int iz = 0; iz < zSteps; iz++)
+        {
+            int z0 = iz * step, z1 = Mathf.Min(z0 + step, hRes - 1);
+            Vector3 top0 = HToW(0, z0, heights[z0, 0], hRes, tPos, tSize);
+            Vector3 top1 = HToW(0, z1, heights[z1, 0], hRes, tPos, tSize);
+            Vector3 bot0 = new Vector3(top0.x, bottomY, top0.z);
+            Vector3 bot1 = new Vector3(top1.x, bottomY, top1.z);
+            AddTri(top0, bot0, bot1, target);
+            AddTri(top0, bot1, top1, target);
+        }
+
+        // X-max edge (ix == xSteps, right face, winding faces outward +X)
+        for (int iz = 0; iz < zSteps; iz++)
+        {
+            int z0 = iz * step, z1 = Mathf.Min(z0 + step, hRes - 1);
+            int x = Mathf.Min(xSteps * step, hRes - 1);
+            Vector3 top0 = HToW(x, z0, heights[z0, x], hRes, tPos, tSize);
+            Vector3 top1 = HToW(x, z1, heights[z1, x], hRes, tPos, tSize);
+            Vector3 bot0 = new Vector3(top0.x, bottomY, top0.z);
+            Vector3 bot1 = new Vector3(top1.x, bottomY, top1.z);
+            AddTri(top0, bot1, bot0, target);
+            AddTri(top0, top1, bot1, target);
+        }
     }
 
     static Vector3 HToW(int x, int z, float h, int hRes, Vector3 tPos, Vector3 tSize)
