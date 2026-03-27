@@ -13,6 +13,9 @@
 #pragma kernel CopyStaticToWorking
 #pragma kernel ClearFlood
 #pragma kernel BlurFill
+#pragma kernel CopyAndClearFlood
+#pragma kernel ClearVoxelBuffer
+#pragma kernel CopyWorkingToStatic
 
 // ---- Grid ----
 int _Width, _Height, _Depth;
@@ -33,6 +36,11 @@ int _TotalVoxels; // Width * Height * Depth (for linear dispatches)
 
 // ---- Sweep parameters ----
 int _SweepAxis; // 0=X, 1=Y, 2=Z
+
+// ---- Region offset (dirty-region dispatch) ----
+// When dispatching over a sub-region, id=(0,0,0) maps to _RegionMin.
+// For full-grid dispatches, set to (0,0,0).
+int _RegionMinX, _RegionMinY, _RegionMinZ;
 
 // ---- Output 3D textures ----
 RWTexture3D<float>  _FillTex;
@@ -106,12 +114,13 @@ bool TriAABBIntersect(float3 va, float3 vb, float3 vc, float3 center, float3 ext
 [numthreads(8, 8, 8)]
 void Clear(uint3 id : SV_DispatchThreadID)
 {
-    if ((int)id.x >= _Width || (int)id.y >= _Height || (int)id.z >= _Depth) return;
-    int idx = VoxelIndex((int)id.x, (int)id.y, (int)id.z);
+    int3 p = int3(_RegionMinX, _RegionMinY, _RegionMinZ) + (int3)id;
+    if (p.x >= _Width || p.y >= _Height || p.z >= _Depth) return;
+    int idx = VoxelIndex(p.x, p.y, p.z);
     _VoxelBuffer[idx] = 0u;
     _FloodBuffer[idx] = 0u;
-    _FillTex[id] = 0.0;
-    _NormalTex[id] = float4(0, 0, 0, 0);
+    _FillTex[p] = 0.0;
+    _NormalTex[p] = float4(0, 0, 0, 0);
 }
 
 // 1: Surface voxelization — all triangles, atomic write
@@ -152,8 +161,12 @@ void Surface(uint3 id : SV_DispatchThreadID)
 [numthreads(8, 8, 1)]
 void SweepFill(uint3 id : SV_DispatchThreadID)
 {
-    int a = (int)id.x;
-    int b = (int)id.y;
+    // Region-offset cross-section coords: dispatch covers the dirty sub-plane,
+    // but each thread still sweeps the full axis length for correctness.
+    int a, b;
+    if (_SweepAxis == 0)      { a = _RegionMinY + (int)id.x; b = _RegionMinZ + (int)id.y; }
+    else if (_SweepAxis == 1) { a = _RegionMinX + (int)id.x; b = _RegionMinZ + (int)id.y; }
+    else                      { a = _RegionMinX + (int)id.x; b = _RegionMinY + (int)id.y; }
 
     int dimA, dimB, dimSweep;
     if (_SweepAxis == 0)      { dimA = _Height; dimB = _Depth;  dimSweep = _Width;  }
@@ -224,20 +237,20 @@ void SweepFill(uint3 id : SV_DispatchThreadID)
 [numthreads(8, 8, 8)]
 void BuildTexture(uint3 id : SV_DispatchThreadID)
 {
-    if ((int)id.x >= _Width || (int)id.y >= _Height || (int)id.z >= _Depth) return;
-    int idx = VoxelIndex((int)id.x, (int)id.y, (int)id.z);
+    int3 p = int3(_RegionMinX, _RegionMinY, _RegionMinZ) + (int3)id;
+    if (p.x >= _Width || p.y >= _Height || p.z >= _Depth) return;
+    int idx = VoxelIndex(p.x, p.y, p.z);
     uint surfVal = _VoxelBuffer[idx];
     bool isSurface = surfVal > 0u;
 
     if (_FillVolume == 0)
     {
-        _FillTex[id] = isSurface ? 1.0 : 0.0;
+        _FillTex[p] = isSurface ? 1.0 : 0.0;
     }
     else
     {
         bool isOutside = _FloodBuffer[idx] > 0u;
-        // Filled = surface voxels + interior (not surface, not outside)
-        _FillTex[id] = (!isOutside || isSurface) ? 1.0 : 0.0;
+        _FillTex[p] = (!isOutside || isSurface) ? 1.0 : 0.0;
     }
 }
 
@@ -245,7 +258,7 @@ void BuildTexture(uint3 id : SV_DispatchThreadID)
 [numthreads(8, 8, 8)]
 void ComputeNormals(uint3 id : SV_DispatchThreadID)
 {
-    int3 p = (int3)id;
+    int3 p = int3(_RegionMinX, _RegionMinY, _RegionMinZ) + (int3)id;
     if (p.x >= _Width || p.y >= _Height || p.z >= _Depth) return;
 
     float here = _FillTex[p];
@@ -275,21 +288,23 @@ void ComputeNormals(uint3 id : SV_DispatchThreadID)
     _NormalTex[p] = float4(n, 1);
 }
 
-// 5: Copy cached static voxels into working buffer (linear dispatch)
-[numthreads(256, 1, 1)]
+// 5: Copy cached static voxels into working buffer
+[numthreads(8, 8, 8)]
 void CopyStaticToWorking(uint3 id : SV_DispatchThreadID)
 {
-    int idx = (int)id.x;
-    if (idx >= _TotalVoxels) return;
+    int3 p = int3(_RegionMinX, _RegionMinY, _RegionMinZ) + (int3)id;
+    if (p.x >= _Width || p.y >= _Height || p.z >= _Depth) return;
+    int idx = VoxelIndex(p.x, p.y, p.z);
     _VoxelBuffer[idx] = _StaticVoxelBuffer[idx];
 }
 
-// 6: Clear flood buffer only (linear dispatch, avoids clearing voxels + textures)
-[numthreads(256, 1, 1)]
+// 6: Clear flood buffer only (avoids clearing voxels + textures)
+[numthreads(8, 8, 8)]
 void ClearFlood(uint3 id : SV_DispatchThreadID)
 {
-    int idx = (int)id.x;
-    if (idx >= _TotalVoxels) return;
+    int3 p = int3(_RegionMinX, _RegionMinY, _RegionMinZ) + (int3)id;
+    if (p.x >= _Width || p.y >= _Height || p.z >= _Depth) return;
+    int idx = VoxelIndex(p.x, p.y, p.z);
     _FloodBuffer[idx] = 0u;
 }
 
@@ -297,7 +312,7 @@ void ClearFlood(uint3 id : SV_DispatchThreadID)
 [numthreads(8, 8, 8)]
 void BlurFill(uint3 id : SV_DispatchThreadID)
 {
-    int3 p = (int3)id;
+    int3 p = int3(_RegionMinX, _RegionMinY, _RegionMinZ) + (int3)id;
     if (p.x >= _Width || p.y >= _Height || p.z >= _Depth) return;
 
     float sum = 0.0;
@@ -310,4 +325,36 @@ void BlurFill(uint3 id : SV_DispatchThreadID)
     }
 
     _BlurredFillTex[p] = sum / 27.0;
+}
+
+// 8: Merged copy static → working + clear flood in one dispatch
+[numthreads(8, 8, 8)]
+void CopyAndClearFlood(uint3 id : SV_DispatchThreadID)
+{
+    int3 p = int3(_RegionMinX, _RegionMinY, _RegionMinZ) + (int3)id;
+    if (p.x >= _Width || p.y >= _Height || p.z >= _Depth) return;
+    int idx = VoxelIndex(p.x, p.y, p.z);
+    _VoxelBuffer[idx] = _StaticVoxelBuffer[idx];
+    _FloodBuffer[idx] = 0u;
+}
+
+// 9: Clear a voxel buffer to zero (generic, used for static cache clear)
+[numthreads(8, 8, 8)]
+void ClearVoxelBuffer(uint3 id : SV_DispatchThreadID)
+{
+    int3 p = int3(_RegionMinX, _RegionMinY, _RegionMinZ) + (int3)id;
+    if (p.x >= _Width || p.y >= _Height || p.z >= _Depth) return;
+    int idx = VoxelIndex(p.x, p.y, p.z);
+    _VoxelBuffer[idx] = 0u;
+}
+
+// 10: Copy working buffer → static cache (GPU-side, avoids CPU readback stall)
+RWStructuredBuffer<uint> _DstBuffer;
+[numthreads(8, 8, 8)]
+void CopyWorkingToStatic(uint3 id : SV_DispatchThreadID)
+{
+    int3 p = int3(_RegionMinX, _RegionMinY, _RegionMinZ) + (int3)id;
+    if (p.x >= _Width || p.y >= _Height || p.z >= _Depth) return;
+    int idx = VoxelIndex(p.x, p.y, p.z);
+    _DstBuffer[idx] = _VoxelBuffer[idx];
 }

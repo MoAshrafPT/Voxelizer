@@ -34,6 +34,10 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     [Tooltip("Number of sweep rounds for flood fill (1 handles most geometry, 2 for complex concavities)")]
     [Range(1, 4)] public int fillSweepRounds = 1;
 
+    [Header("Normals")]
+    [Tooltip("Compute gradient normals each frame. Disable if consumer only needs binary fill.")]
+    public bool computeNormals = true;
+
     [Header("Scene Input")]
     public bool includeMeshRenderers = true;
     public bool includeSkinnedMeshRenderers = true;
@@ -56,6 +60,12 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         public Vector3 a, b, c, n;
     }
 
+    /// <summary>Per-object dirty region in grid coordinates.</summary>
+    struct DirtyRegion
+    {
+        public Vector3Int min, max;
+    }
+
     // ================================================================
     // Public accessors for the camera
     // ================================================================
@@ -76,6 +86,7 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     // Kernel indices
     int KClear, KSurface, KSweepFill, KBuildTexture, KComputeNormals;
     int KCopyStaticToWorking, KClearFlood, KBlurFill;
+    int KCopyAndClearFlood, KClearVoxelBuffer, KCopyWorkingToStatic;
     bool _kernelsCached;
 
     // GPU buffers
@@ -102,9 +113,28 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     readonly List<Tri> _dynamicTriList = new List<Tri>(16 * 1024);
     Mesh _bakedMesh;
 
+    // Reusable mesh data lists (zero GC per frame)
+    readonly List<Vector3> _tmpVerts = new List<Vector3>(4096);
+    readonly List<int> _tmpIndices = new List<int>(12288);
+
+    // Registration-based object tracking (avoids FindObjectsByType per frame)
+    static readonly HashSet<VoxelDynamic> _registeredDynamics = new HashSet<VoxelDynamic>();
+    static readonly HashSet<SkinnedMeshRenderer> _registeredSkins = new HashSet<SkinnedMeshRenderer>();
+
+    public static void RegisterDynamic(VoxelDynamic vd) { if (vd != null) _registeredDynamics.Add(vd); }
+    public static void UnregisterDynamic(VoxelDynamic vd) { _registeredDynamics.Remove(vd); }
+    public static void RegisterSkin(SkinnedMeshRenderer smr) { if (smr != null) _registeredSkins.Add(smr); }
+    public static void UnregisterSkin(SkinnedMeshRenderer smr) { _registeredSkins.Remove(smr); }
+
     // Dirty flags
     bool _staticDirty = true;      // rebuild static tris + re-voxelize static layer
     bool _hasDynamicObjects;       // any dynamic objects exist in scene
+
+    // Per-object dirty region tracking
+    readonly List<DirtyRegion> _curDirtyRegions = new List<DirtyRegion>(16);
+    readonly List<DirtyRegion> _prevDirtyRegions = new List<DirtyRegion>(16);
+    readonly List<DirtyRegion> _mergedDirtyRegions = new List<DirtyRegion>(32);
+    readonly List<DirtyRegion> _consolidatedRegions = new List<DirtyRegion>(16);
 
     // ================================================================
     // Lifecycle
@@ -182,12 +212,15 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         if (_staticTriCount == 0)
         {
             // No static geometry — just clear the static voxel cache
-            ClearStaticVoxelCache();
+            SetGridUniforms(gx, gy, gz);
+            SetRegionMin(0, 0, 0);
+            ClearStaticVoxelCache(gx, gy, gz);
             return;
         }
 
         // Voxelize static geometry once → store in _staticVoxelBuf
         SetGridUniforms(gx, gy, gz);
+        SetRegionMin(0, 0, 0);
         BindClearBuffers();
         Dispatch3D(KClear, gx, gy, gz);
 
@@ -197,22 +230,32 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         DispatchLinear(KSurface, _staticTriCount);
 
         // Copy result to static cache
-        CopyWorkingToStaticCache();
+        CopyWorkingToStaticCache(gx, gy, gz);
+
+        // Run the full fill pipeline so output textures are pre-populated
+        // with the static-only result. This makes per-frame work ZERO
+        // when no dynamic objects exist.
+        var fullMin = Vector3Int.zero;
+        var fullMax = new Vector3Int(gx - 1, gy - 1, gz - 1);
+        RunFillPipeline(gx, gy, gz, fullMin, fullMax);
+
+        // Reset dirty-region tracking after full bake
+        _prevDirtyRegions.Clear();
     }
 
-    void ClearStaticVoxelCache()
+    void ClearStaticVoxelCache(int gx, int gy, int gz)
     {
-        // Fill static cache with zeros
-        var zeros = new uint[_totalVoxels];
-        _staticVoxelBuf.SetData(zeros);
+        // GPU-side clear via the ClearVoxelBuffer kernel (3D dispatch, safe for any grid size)
+        coreCS.SetBuffer(KClearVoxelBuffer, "_VoxelBuffer", _staticVoxelBuf);
+        Dispatch3D(KClearVoxelBuffer, gx, gy, gz);
     }
 
-    void CopyWorkingToStaticCache()
+    void CopyWorkingToStaticCache(int gx, int gy, int gz)
     {
-        // GPU→CPU→GPU copy via GetData/SetData for the one-time static bake
-        var data = new uint[_totalVoxels];
-        _voxelBuffer.GetData(data);
-        _staticVoxelBuf.SetData(data);
+        // GPU-side copy: working → static cache (no readback stall)
+        coreCS.SetBuffer(KCopyWorkingToStatic, "_VoxelBuffer", _voxelBuffer);
+        coreCS.SetBuffer(KCopyWorkingToStatic, "_DstBuffer", _staticVoxelBuf);
+        Dispatch3D(KCopyWorkingToStatic, gx, gy, gz);
     }
 
     // ================================================================
@@ -227,23 +270,54 @@ public sealed class VoxelTracerSystem : MonoBehaviour
 
         // Rebuild dynamic triangle list every frame
         BuildDynamicTriangleList();
-        UploadDynamicTriangles();
 
+        bool hasDynamics = _dynamicTriList.Count > 0;
+
+        // Fast path: no dynamic objects and no previous dirty regions to restore
+        if (!hasDynamics && _prevDirtyRegions.Count == 0)
+            return;
+
+        // Collect all raw regions (current + previous, un-padded)
+        _mergedDirtyRegions.Clear();
+        for (int i = 0; i < _curDirtyRegions.Count; i++)
+            _mergedDirtyRegions.Add(_curDirtyRegions[i]);
+        for (int i = 0; i < _prevDirtyRegions.Count; i++)
+            _mergedDirtyRegions.Add(_prevDirtyRegions[i]);
+
+        // Pad all regions, then consolidate overlapping/nearby ones
+        const int pad = 3;
+        var gridMax = new Vector3Int(gx - 1, gy - 1, gz - 1);
+        for (int i = 0; i < _mergedDirtyRegions.Count; i++)
+        {
+            var r = _mergedDirtyRegions[i];
+            r.min = Vector3Int.Max(r.min - new Vector3Int(pad, pad, pad), Vector3Int.zero);
+            r.max = Vector3Int.Min(r.max + new Vector3Int(pad, pad, pad), gridMax);
+            _mergedDirtyRegions[i] = r;
+        }
+        ConsolidateRegions(_mergedDirtyRegions, _consolidatedRegions);
+
+        // Update tracking: current becomes previous for next frame
+        _prevDirtyRegions.Clear();
+        for (int i = 0; i < _curDirtyRegions.Count; i++)
+            _prevDirtyRegions.Add(_curDirtyRegions[i]); // store UN-padded
+
+        UploadDynamicTriangles();
         SetGridUniforms(gx, gy, gz);
 
-        // 1) Copy cached static voxels → working buffer (fast linear kernel)
-        coreCS.SetInt("_TotalVoxels", _totalVoxels);
-        coreCS.SetBuffer(KCopyStaticToWorking, "_VoxelBuffer", _voxelBuffer);
-        coreCS.SetBuffer(KCopyStaticToWorking, "_StaticVoxelBuffer", _staticVoxelBuf);
-        DispatchLinear(KCopyStaticToWorking, _totalVoxels);
+        // 1+2) Restore each consolidated dirty region: copy static + clear flood
+        coreCS.SetBuffer(KCopyAndClearFlood, "_VoxelBuffer", _voxelBuffer);
+        coreCS.SetBuffer(KCopyAndClearFlood, "_StaticVoxelBuffer", _staticVoxelBuf);
+        coreCS.SetBuffer(KCopyAndClearFlood, "_FloodBuffer", _floodBuffer);
+        for (int i = 0; i < _consolidatedRegions.Count; i++)
+        {
+            var r = _consolidatedRegions[i];
+            Vector3Int sz = r.max - r.min + Vector3Int.one;
+            SetRegionMin(r.min.x, r.min.y, r.min.z);
+            Dispatch3D(KCopyAndClearFlood, sz.x, sz.y, sz.z);
+        }
 
-        // 2) Clear flood buffer only (not voxels — we just populated them)
-        coreCS.SetBuffer(KClearFlood, "_FloodBuffer", _floodBuffer);
-        coreCS.SetInt("_TotalVoxels", _totalVoxels);
-        DispatchLinear(KClearFlood, _totalVoxels);
-
-        // 3) Surface voxelization — dynamic triangles only (atomic OR on top of static)
-        if (_dynamicTriCount > 0)
+        // 3) Surface voxelization — all dynamic triangles at once
+        if (hasDynamics)
         {
             coreCS.SetBuffer(KSurface, "_VoxelBuffer", _voxelBuffer);
             coreCS.SetBuffer(KSurface, "_Tris", _dynamicTriBuffer);
@@ -251,36 +325,103 @@ public sealed class VoxelTracerSystem : MonoBehaviour
             DispatchLinear(KSurface, _dynamicTriCount);
         }
 
-        // 4) Sweep flood fill
+        // 4-7) Fill pipeline per consolidated region
+        for (int i = 0; i < _consolidatedRegions.Count; i++)
+        {
+            var r = _consolidatedRegions[i];
+            RunFillPipeline(gx, gy, gz, r.min, r.max);
+        }
+    }
+
+    /// <summary>Merge overlapping or nearby regions to minimize dispatch count.
+    /// Uses greedy iterative merging: any two regions whose AABBs overlap are
+    /// unioned into one. Repeats until stable. O(N^2) but N is tiny (< 20).</summary>
+    static void ConsolidateRegions(List<DirtyRegion> input, List<DirtyRegion> output)
+    {
+        output.Clear();
+        for (int i = 0; i < input.Count; i++)
+            output.Add(input[i]);
+
+        bool merged = true;
+        while (merged)
+        {
+            merged = false;
+            for (int i = 0; i < output.Count; i++)
+            {
+                for (int j = i + 1; j < output.Count; j++)
+                {
+                    var a = output[i];
+                    var b = output[j];
+
+                    // Check AABB overlap (regions already padded, so touching = overlapping)
+                    if (a.min.x <= b.max.x && a.max.x >= b.min.x &&
+                        a.min.y <= b.max.y && a.max.y >= b.min.y &&
+                        a.min.z <= b.max.z && a.max.z >= b.min.z)
+                    {
+                        // Union them
+                        output[i] = new DirtyRegion
+                        {
+                            min = Vector3Int.Min(a.min, b.min),
+                            max = Vector3Int.Max(a.max, b.max)
+                        };
+                        output.RemoveAt(j);
+                        merged = true;
+                        break;
+                    }
+                }
+                if (merged) break;
+            }
+        }
+    }
+
+    /// <summary>Shared fill pipeline: sweep fill → build texture → blur → normals.
+    /// Region parameters control which voxels are processed.
+    /// For full-grid: regMin=(0,0,0), regMax=(W-1,H-1,D-1).
+    /// For dirty-region: regMin/Max = padded dynamic AABB in grid coords.</summary>
+    void RunFillPipeline(int gx, int gy, int gz, Vector3Int regMin, Vector3Int regMax)
+    {
+        Vector3Int regSize = regMax - regMin + Vector3Int.one;
+
+        // Sweep flood fill — only lines that cross the dirty region,
+        // but each line sweeps full axis length for correctness
         if (fillVolume)
         {
             coreCS.SetBuffer(KSweepFill, "_VoxelBuffer", _voxelBuffer);
             coreCS.SetBuffer(KSweepFill, "_FloodBuffer", _floodBuffer);
             for (int round = 0; round < fillSweepRounds; round++)
             {
-                DispatchSweep(0, gy, gz);
-                DispatchSweep(1, gx, gz);
-                DispatchSweep(2, gx, gy);
+                DispatchSweepRegion(0, regMin, regMax);
+                DispatchSweepRegion(1, regMin, regMax);
+                DispatchSweepRegion(2, regMin, regMax);
             }
         }
 
-        // 5) Build fill texture
+        // Build fill texture (dirty region only)
+        SetRegionMin(regMin.x, regMin.y, regMin.z);
         coreCS.SetInt("_FillVolume", fillVolume ? 1 : 0);
         coreCS.SetBuffer(KBuildTexture, "_VoxelBuffer", _voxelBuffer);
         coreCS.SetBuffer(KBuildTexture, "_FloodBuffer", _floodBuffer);
         coreCS.SetTexture(KBuildTexture, "_FillTex", _fillTex);
-        Dispatch3D(KBuildTexture, gx, gy, gz);
+        Dispatch3D(KBuildTexture, regSize.x, regSize.y, regSize.z);
 
-        // 6) Blur fill texture for smooth normals
-        coreCS.SetTexture(KBlurFill, "_FillTex", _fillTex);
-        coreCS.SetTexture(KBlurFill, "_BlurredFillTex", _blurredFillTex);
-        Dispatch3D(KBlurFill, gx, gy, gz);
+        // Blur fill + compute normals (padded by 1 for neighbor reads)
+        if (computeNormals)
+        {
+            Vector3Int blurMin = Vector3Int.Max(regMin - Vector3Int.one, Vector3Int.zero);
+            Vector3Int blurMax = Vector3Int.Min(regMax + Vector3Int.one,
+                new Vector3Int(gx - 1, gy - 1, gz - 1));
+            Vector3Int blurSize = blurMax - blurMin + Vector3Int.one;
 
-        // 7) Compute normals from blurred fill
-        coreCS.SetTexture(KComputeNormals, "_FillTex", _fillTex);
-        coreCS.SetTexture(KComputeNormals, "_BlurredFillTex", _blurredFillTex);
-        coreCS.SetTexture(KComputeNormals, "_NormalTex", _normalsTex);
-        Dispatch3D(KComputeNormals, gx, gy, gz);
+            SetRegionMin(blurMin.x, blurMin.y, blurMin.z);
+            coreCS.SetTexture(KBlurFill, "_FillTex", _fillTex);
+            coreCS.SetTexture(KBlurFill, "_BlurredFillTex", _blurredFillTex);
+            Dispatch3D(KBlurFill, blurSize.x, blurSize.y, blurSize.z);
+
+            coreCS.SetTexture(KComputeNormals, "_FillTex", _fillTex);
+            coreCS.SetTexture(KComputeNormals, "_BlurredFillTex", _blurredFillTex);
+            coreCS.SetTexture(KComputeNormals, "_NormalTex", _normalsTex);
+            Dispatch3D(KComputeNormals, blurSize.x, blurSize.y, blurSize.z);
+        }
     }
 
     void SetGridUniforms(int gx, int gy, int gz)
@@ -291,6 +432,13 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         coreCS.SetVector("_Start", _activeMin);
         coreCS.SetFloat("_Unit", voxelSize);
         coreCS.SetFloat("_HalfUnit", voxelSize * 0.5f);
+    }
+
+    void SetRegionMin(int x, int y, int z)
+    {
+        coreCS.SetInt("_RegionMinX", x);
+        coreCS.SetInt("_RegionMinY", y);
+        coreCS.SetInt("_RegionMinZ", z);
     }
 
     void BindClearBuffers()
@@ -359,62 +507,116 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         }
     }
 
-    /// <summary>Lightweight per-frame rebuild of dynamic triangles only.</summary>
+    /// <summary>Lightweight per-frame rebuild of dynamic triangles only.
+    /// Uses registration-based tracking (O(1) list access) instead of FindObjectsByType (O(N) scene scan).
+    /// Also computes per-object grid AABBs for dirty-region tracking.</summary>
     void BuildDynamicTriangleList()
     {
         _dynamicTriList.Clear();
+        _curDirtyRegions.Clear();
+
+        float inv = 1f / voxelSize;
+        var gridClampMax = new Vector3Int(_nx - 1, _ny - 1, _nz - 1);
 
         if (includeMeshRenderers)
         {
-            var dynamics = FindObjectsByType<VoxelDynamic>(FindObjectsSortMode.None);
-            foreach (var vd in dynamics)
+            foreach (var vd in _registeredDynamics)
             {
                 if (vd == null || !vd.gameObject.activeInHierarchy) continue;
                 var mf = vd.GetComponent<MeshFilter>();
                 if (mf == null || mf.sharedMesh == null) continue;
                 var mr = vd.GetComponent<MeshRenderer>();
                 if (mr == null || !mr.enabled) continue;
+
+                int startIdx = _dynamicTriList.Count;
                 AppendMesh(mf.sharedMesh, mf.transform.localToWorldMatrix, _dynamicTriList);
+                AddDirtyRegionFromTris(startIdx, inv, gridClampMax);
             }
         }
 
         if (includeSkinnedMeshRenderers)
         {
             if (_bakedMesh == null) _bakedMesh = new Mesh();
-            var skins = FindObjectsByType<SkinnedMeshRenderer>(FindObjectsSortMode.None);
-            foreach (var smr in skins)
+            foreach (var smr in _registeredSkins)
             {
                 if (smr == null || !smr.enabled || !smr.gameObject.activeInHierarchy) continue;
                 _bakedMesh.Clear();
                 try { smr.BakeMesh(_bakedMesh); } catch { continue; }
+
+                int startIdx = _dynamicTriList.Count;
                 AppendMesh(_bakedMesh, smr.transform.localToWorldMatrix, _dynamicTriList);
+                AddDirtyRegionFromTris(startIdx, inv, gridClampMax);
             }
         }
     }
 
+    void AddDirtyRegionFromTris(int startIdx, float inv, Vector3Int gridClampMax)
+    {
+        if (startIdx >= _dynamicTriList.Count) return;
+
+        Vector3 mn = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+        Vector3 mx = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+
+        for (int i = startIdx; i < _dynamicTriList.Count; i++)
+        {
+            var t = _dynamicTriList[i];
+            mn = Vector3.Min(mn, Vector3.Min(t.a, Vector3.Min(t.b, t.c)));
+            mx = Vector3.Max(mx, Vector3.Max(t.a, Vector3.Max(t.b, t.c)));
+        }
+
+        var gMin = new Vector3Int(
+            Mathf.FloorToInt((mn.x - _activeMin.x) * inv),
+            Mathf.FloorToInt((mn.y - _activeMin.y) * inv),
+            Mathf.FloorToInt((mn.z - _activeMin.z) * inv)
+        );
+        var gMax = new Vector3Int(
+            Mathf.CeilToInt((mx.x - _activeMin.x) * inv),
+            Mathf.CeilToInt((mx.y - _activeMin.y) * inv),
+            Mathf.CeilToInt((mx.z - _activeMin.z) * inv)
+        );
+
+        gMin = Vector3Int.Max(gMin, Vector3Int.zero);
+        gMax = Vector3Int.Min(gMax, gridClampMax);
+
+        _curDirtyRegions.Add(new DirtyRegion { min = gMin, max = gMax });
+    }
+
+    /// <summary>Zero-GC mesh triangle extraction. Uses Mesh.GetVertices/GetIndices
+    /// which reuse pre-allocated Lists instead of allocating new arrays.
+    /// Iterates all submeshes to match the old mesh.triangles behavior.</summary>
     void AppendMesh(Mesh mesh, Matrix4x4 l2w, List<Tri> target)
     {
-        var verts = mesh.vertices;
-        var tris = mesh.triangles;
-        if (verts == null || tris == null || tris.Length < 3) return;
+        mesh.GetVertices(_tmpVerts);
+        int vertCount = _tmpVerts.Count;
+        if (vertCount == 0) return;
 
-        for (int i = 0; i < tris.Length; i += 3)
+        int subMeshCount = mesh.subMeshCount;
+        for (int sub = 0; sub < subMeshCount; sub++)
         {
-            int i0 = tris[i], i1 = tris[i + 1], i2 = tris[i + 2];
-            if ((uint)i0 >= (uint)verts.Length ||
-                (uint)i1 >= (uint)verts.Length ||
-                (uint)i2 >= (uint)verts.Length) continue;
+            if (mesh.GetTopology(sub) != MeshTopology.Triangles) continue;
 
-            Vector3 a = l2w.MultiplyPoint3x4(verts[i0]);
-            Vector3 b = l2w.MultiplyPoint3x4(verts[i1]);
-            Vector3 c = l2w.MultiplyPoint3x4(verts[i2]);
+            mesh.GetIndices(_tmpIndices, sub);
+            int idxCount = _tmpIndices.Count;
+            if (idxCount < 3) continue;
 
-            Vector3 n = Vector3.Cross(b - a, c - a);
-            float len2 = n.sqrMagnitude;
-            if (len2 < 1e-20f) continue;
-            n /= Mathf.Sqrt(len2);
+            for (int i = 0; i < idxCount; i += 3)
+            {
+                int i0 = _tmpIndices[i], i1 = _tmpIndices[i + 1], i2 = _tmpIndices[i + 2];
+                if ((uint)i0 >= (uint)vertCount ||
+                    (uint)i1 >= (uint)vertCount ||
+                    (uint)i2 >= (uint)vertCount) continue;
 
-            target.Add(new Tri { a = a, b = b, c = c, n = n });
+                Vector3 a = l2w.MultiplyPoint3x4(_tmpVerts[i0]);
+                Vector3 b = l2w.MultiplyPoint3x4(_tmpVerts[i1]);
+                Vector3 c = l2w.MultiplyPoint3x4(_tmpVerts[i2]);
+
+                Vector3 n = Vector3.Cross(b - a, c - a);
+                float len2 = n.sqrMagnitude;
+                if (len2 < 1e-20f) continue;
+                n /= Mathf.Sqrt(len2);
+
+                target.Add(new Tri { a = a, b = b, c = c, n = n });
+            }
         }
     }
 
@@ -609,6 +811,9 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         KCopyStaticToWorking = coreCS.FindKernel("CopyStaticToWorking");
         KClearFlood = coreCS.FindKernel("ClearFlood");
         KBlurFill = coreCS.FindKernel("BlurFill");
+        KCopyAndClearFlood = coreCS.FindKernel("CopyAndClearFlood");
+        KClearVoxelBuffer = coreCS.FindKernel("ClearVoxelBuffer");
+        KCopyWorkingToStatic = coreCS.FindKernel("CopyWorkingToStatic");
         _kernelsCached = true;
     }
 
@@ -746,6 +951,17 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     void DispatchSweep(int axis, int planeA, int planeB)
     {
         coreCS.SetInt("_SweepAxis", axis);
+        Dispatch2D(KSweepFill, planeA, planeB);
+    }
+
+    void DispatchSweepRegion(int axis, Vector3Int regMin, Vector3Int regMax)
+    {
+        coreCS.SetInt("_SweepAxis", axis);
+        SetRegionMin(regMin.x, regMin.y, regMin.z);
+        int planeA, planeB;
+        if (axis == 0) { planeA = regMax.y - regMin.y + 1; planeB = regMax.z - regMin.z + 1; }
+        else if (axis == 1) { planeA = regMax.x - regMin.x + 1; planeB = regMax.z - regMin.z + 1; }
+        else { planeA = regMax.x - regMin.x + 1; planeB = regMax.y - regMin.y + 1; }
         Dispatch2D(KSweepFill, planeA, planeB);
     }
 
