@@ -35,8 +35,8 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     [Range(1, 4)] public int fillSweepRounds = 1;
 
     [Header("Normals")]
-    [Tooltip("Compute gradient normals each frame. Disable if consumer only needs binary fill.")]
-    public bool computeNormals = true;
+    [Tooltip("Compute gradient normals each frame. Only enable if a consumer reads NormalsTexture.")]
+    public bool computeNormals = false;
 
     [Header("Scene Input")]
     public bool includeMeshRenderers = true;
@@ -57,7 +57,7 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     [StructLayout(LayoutKind.Sequential)]
     struct Tri
     {
-        public Vector3 a, b, c, n;
+        public Vector3 a, b, c;
     }
 
     /// <summary>Per-object dirty region in grid coordinates.</summary>
@@ -85,14 +85,15 @@ public sealed class VoxelTracerSystem : MonoBehaviour
 
     // Kernel indices
     int KClear, KSurface, KSweepFill, KBuildTexture, KComputeNormals;
-    int KCopyStaticToWorking, KClearFlood, KBlurFill;
-    int KCopyAndClearFlood, KClearVoxelBuffer, KCopyWorkingToStatic;
+    int KBlurFill;
+    int KCopyAndClearFlood, KCopyAndClearFloodLinear;
+    int KRestoreStaticFull, KRestoreStaticFullLinear;
+    int KClearVoxelBuffer, KCopyWorkingToStatic;
     bool _kernelsCached;
 
     // GPU buffers
-    ComputeBuffer _voxelBuffer;      // working buffer (combined static + dynamic)
-    ComputeBuffer _floodBuffer;      // flood fill outside markers
-    ComputeBuffer _staticVoxelBuf;   // cached static surface voxels
+    ComputeBuffer _voxelBuffer;      // working buffer: packed (bit 0=surface, bit 1=outside)
+    ComputeBuffer _staticVoxelBuf;   // cached static packed (surface + flood)
     ComputeBuffer _staticTriBuffer;  // static triangles (uploaded once)
     ComputeBuffer _dynamicTriBuffer; // dynamic triangles (uploaded every frame)
     int _staticTriCount;
@@ -229,15 +230,16 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         coreCS.SetInt("_TriCount", _staticTriCount);
         DispatchLinear(KSurface, _staticTriCount);
 
-        // Copy result to static cache
-        CopyWorkingToStaticCache(gx, gy, gz);
-
         // Run the full fill pipeline so output textures are pre-populated
         // with the static-only result. This makes per-frame work ZERO
         // when no dynamic objects exist.
         var fullMin = Vector3Int.zero;
         var fullMax = new Vector3Int(gx - 1, gy - 1, gz - 1);
         RunFillPipeline(gx, gy, gz, fullMin, fullMax);
+
+        // Copy AFTER fill pipeline: static cache now includes surface (bit 0) + flood (bit 1).
+        // This enables restoration frames to skip sweep entirely.
+        CopyWorkingToStaticCache(gx, gy, gz);
 
         // Reset dirty-region tracking after full bake
         _prevDirtyRegions.Clear();
@@ -301,13 +303,106 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         for (int i = 0; i < _curDirtyRegions.Count; i++)
             _prevDirtyRegions.Add(_curDirtyRegions[i]); // store UN-padded
 
-        UploadDynamicTriangles();
         SetGridUniforms(gx, gy, gz);
 
-        // 1+2) Restore each consolidated dirty region: copy static + clear flood
+        // Decide: full-grid fast path OR per-region path.
+        bool useFullGrid = false;
+        if (_consolidatedRegions.Count == 1)
+        {
+            var r = _consolidatedRegions[0];
+            long dirtyVol = (long)(r.max.x - r.min.x + 1)
+                          * (r.max.y - r.min.y + 1)
+                          * (r.max.z - r.min.z + 1);
+            if (dirtyVol * 2 >= _totalVoxels)
+                useFullGrid = true;
+        }
+
+        // Non-dynamic restoration: static cache includes flood, skip sweep entirely.
+        if (!hasDynamics)
+        {
+            VoxelizeFrameRestore(gx, gy, gz, useFullGrid);
+            return;
+        }
+
+        UploadDynamicTriangles();
+
+        if (useFullGrid)
+        {
+            VoxelizeFrameFullGrid(gx, gy, gz,
+                _consolidatedRegions[0]);
+        }
+        else
+        {
+            VoxelizeFrameRegions(gx, gy, gz);
+        }
+    }
+
+    /// <summary>Restoration path: dynamics have disappeared, restore static state.
+    /// Static cache includes pre-computed flood marks, so sweep is skipped entirely.
+    /// Saves 3 sweep dispatches + surface dispatch on transition frames.</summary>
+    void VoxelizeFrameRestore(int gx, int gy, int gz, bool useFullGrid)
+    {
+        if (useFullGrid)
+        {
+            // Restore full static surface + flood with linear coalescing
+            coreCS.SetInt("_TotalVoxels", _totalVoxels);
+            coreCS.SetBuffer(KRestoreStaticFullLinear, "_VoxelBuffer", _voxelBuffer);
+            coreCS.SetBuffer(KRestoreStaticFullLinear, "_StaticVoxelBuffer", _staticVoxelBuf);
+            DispatchLinear(KRestoreStaticFullLinear, _totalVoxels);
+
+            // BuildTexture scoped to dirty region (skip sweep — flood is correct from cache)
+            var r = _consolidatedRegions[0];
+            RunBuildOnly(gx, gy, gz, r.min, r.max);
+        }
+        else
+        {
+            // Per-region restore: copy full static (surface + flood) into dirty regions
+            coreCS.SetBuffer(KRestoreStaticFull, "_VoxelBuffer", _voxelBuffer);
+            coreCS.SetBuffer(KRestoreStaticFull, "_StaticVoxelBuffer", _staticVoxelBuf);
+            for (int i = 0; i < _consolidatedRegions.Count; i++)
+            {
+                var r = _consolidatedRegions[i];
+                Vector3Int sz = r.max - r.min + Vector3Int.one;
+                SetRegionMin(r.min.x, r.min.y, r.min.z);
+                Dispatch3D(KRestoreStaticFull, sz.x, sz.y, sz.z);
+            }
+
+            // BuildTexture per region (no sweep needed)
+            for (int i = 0; i < _consolidatedRegions.Count; i++)
+            {
+                var r = _consolidatedRegions[i];
+                RunBuildOnly(gx, gy, gz, r.min, r.max);
+            }
+        }
+    }
+
+    /// <summary>Full-grid path: linear kernel for buffer copy (perfect coalescing),
+    /// fill pipeline scoped to dirty region. Used when dirty volume is large.</summary>
+    void VoxelizeFrameFullGrid(int gx, int gy, int gz, DirtyRegion dirtyRegion)
+    {
+        // 1) Copy static surface, clear flood — single linear dispatch
+        coreCS.SetInt("_TotalVoxels", _totalVoxels);
+        coreCS.SetBuffer(KCopyAndClearFloodLinear, "_VoxelBuffer", _voxelBuffer);
+        coreCS.SetBuffer(KCopyAndClearFloodLinear, "_StaticVoxelBuffer", _staticVoxelBuf);
+        DispatchLinear(KCopyAndClearFloodLinear, _totalVoxels);
+
+        // 2) Surface voxelization — dynamic triangles
+        coreCS.SetBuffer(KSurface, "_VoxelBuffer", _voxelBuffer);
+        coreCS.SetBuffer(KSurface, "_Tris", _dynamicTriBuffer);
+        coreCS.SetInt("_TriCount", _dynamicTriCount);
+        DispatchLinear(KSurface, _dynamicTriCount);
+
+        // 3) Fill pipeline — scoped to dirty region
+        RunFillPipeline(gx, gy, gz, dirtyRegion.min, dirtyRegion.max);
+    }
+
+    /// <summary>Per-region path: only processes dirty sub-volumes.
+    /// Used when dirty volume is small relative to total grid.</summary>
+    void VoxelizeFrameRegions(int gx, int gy, int gz)
+    {
+        // 1) Restore static surface + clear flood per dirty region
         coreCS.SetBuffer(KCopyAndClearFlood, "_VoxelBuffer", _voxelBuffer);
         coreCS.SetBuffer(KCopyAndClearFlood, "_StaticVoxelBuffer", _staticVoxelBuf);
-        coreCS.SetBuffer(KCopyAndClearFlood, "_FloodBuffer", _floodBuffer);
         for (int i = 0; i < _consolidatedRegions.Count; i++)
         {
             var r = _consolidatedRegions[i];
@@ -316,16 +411,13 @@ public sealed class VoxelTracerSystem : MonoBehaviour
             Dispatch3D(KCopyAndClearFlood, sz.x, sz.y, sz.z);
         }
 
-        // 3) Surface voxelization — all dynamic triangles at once
-        if (hasDynamics)
-        {
-            coreCS.SetBuffer(KSurface, "_VoxelBuffer", _voxelBuffer);
-            coreCS.SetBuffer(KSurface, "_Tris", _dynamicTriBuffer);
-            coreCS.SetInt("_TriCount", _dynamicTriCount);
-            DispatchLinear(KSurface, _dynamicTriCount);
-        }
+        // 2) Surface voxelization — all dynamic triangles at once
+        coreCS.SetBuffer(KSurface, "_VoxelBuffer", _voxelBuffer);
+        coreCS.SetBuffer(KSurface, "_Tris", _dynamicTriBuffer);
+        coreCS.SetInt("_TriCount", _dynamicTriCount);
+        DispatchLinear(KSurface, _dynamicTriCount);
 
-        // 4-7) Fill pipeline per consolidated region
+        // 3) Fill pipeline per consolidated region
         for (int i = 0; i < _consolidatedRegions.Count; i++)
         {
             var r = _consolidatedRegions[i];
@@ -375,9 +467,7 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     }
 
     /// <summary>Shared fill pipeline: sweep fill → build texture → blur → normals.
-    /// Region parameters control which voxels are processed.
-    /// For full-grid: regMin=(0,0,0), regMax=(W-1,H-1,D-1).
-    /// For dirty-region: regMin/Max = padded dynamic AABB in grid coords.</summary>
+    /// Region parameters control which voxels are processed.</summary>
     void RunFillPipeline(int gx, int gy, int gz, Vector3Int regMin, Vector3Int regMax)
     {
         Vector3Int regSize = regMax - regMin + Vector3Int.one;
@@ -387,7 +477,6 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         if (fillVolume)
         {
             coreCS.SetBuffer(KSweepFill, "_VoxelBuffer", _voxelBuffer);
-            coreCS.SetBuffer(KSweepFill, "_FloodBuffer", _floodBuffer);
             for (int round = 0; round < fillSweepRounds; round++)
             {
                 DispatchSweepRegion(0, regMin, regMax);
@@ -396,16 +485,24 @@ public sealed class VoxelTracerSystem : MonoBehaviour
             }
         }
 
+        RunBuildOnly(gx, gy, gz, regMin, regMax);
+    }
+
+    /// <summary>Build fill texture (+ optional blur/normals) without sweep.
+    /// Used both after sweep and for restoration frames where flood is pre-computed.</summary>
+    void RunBuildOnly(int gx, int gy, int gz, Vector3Int regMin, Vector3Int regMax)
+    {
+        Vector3Int regSize = regMax - regMin + Vector3Int.one;
+
         // Build fill texture (dirty region only)
         SetRegionMin(regMin.x, regMin.y, regMin.z);
         coreCS.SetInt("_FillVolume", fillVolume ? 1 : 0);
         coreCS.SetBuffer(KBuildTexture, "_VoxelBuffer", _voxelBuffer);
-        coreCS.SetBuffer(KBuildTexture, "_FloodBuffer", _floodBuffer);
         coreCS.SetTexture(KBuildTexture, "_FillTex", _fillTex);
         Dispatch3D(KBuildTexture, regSize.x, regSize.y, regSize.z);
 
         // Blur fill + compute normals (padded by 1 for neighbor reads)
-        if (computeNormals)
+        if (computeNormals && _blurredFillTex != null && _normalsTex != null)
         {
             Vector3Int blurMin = Vector3Int.Max(regMin - Vector3Int.one, Vector3Int.zero);
             Vector3Int blurMax = Vector3Int.Min(regMax + Vector3Int.one,
@@ -444,9 +541,7 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     void BindClearBuffers()
     {
         coreCS.SetBuffer(KClear, "_VoxelBuffer", _voxelBuffer);
-        coreCS.SetBuffer(KClear, "_FloodBuffer", _floodBuffer);
         coreCS.SetTexture(KClear, "_FillTex", _fillTex);
-        coreCS.SetTexture(KClear, "_NormalTex", _normalsTex);
     }
 
     // ================================================================
@@ -528,9 +623,8 @@ public sealed class VoxelTracerSystem : MonoBehaviour
                 var mr = vd.GetComponent<MeshRenderer>();
                 if (mr == null || !mr.enabled) continue;
 
-                int startIdx = _dynamicTriList.Count;
                 AppendMesh(mf.sharedMesh, mf.transform.localToWorldMatrix, _dynamicTriList);
-                AddDirtyRegionFromTris(startIdx, inv, gridClampMax);
+                AddDirtyRegionFromBounds(mr.bounds, inv, gridClampMax);
             }
         }
 
@@ -543,26 +637,16 @@ public sealed class VoxelTracerSystem : MonoBehaviour
                 _bakedMesh.Clear();
                 try { smr.BakeMesh(_bakedMesh); } catch { continue; }
 
-                int startIdx = _dynamicTriList.Count;
                 AppendMesh(_bakedMesh, smr.transform.localToWorldMatrix, _dynamicTriList);
-                AddDirtyRegionFromTris(startIdx, inv, gridClampMax);
+                AddDirtyRegionFromBounds(smr.bounds, inv, gridClampMax);
             }
         }
     }
 
-    void AddDirtyRegionFromTris(int startIdx, float inv, Vector3Int gridClampMax)
+    void AddDirtyRegionFromBounds(Bounds bounds, float inv, Vector3Int gridClampMax)
     {
-        if (startIdx >= _dynamicTriList.Count) return;
-
-        Vector3 mn = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
-        Vector3 mx = new Vector3(float.MinValue, float.MinValue, float.MinValue);
-
-        for (int i = startIdx; i < _dynamicTriList.Count; i++)
-        {
-            var t = _dynamicTriList[i];
-            mn = Vector3.Min(mn, Vector3.Min(t.a, Vector3.Min(t.b, t.c)));
-            mx = Vector3.Max(mx, Vector3.Max(t.a, Vector3.Max(t.b, t.c)));
-        }
+        Vector3 mn = bounds.min;
+        Vector3 mx = bounds.max;
 
         var gMin = new Vector3Int(
             Mathf.FloorToInt((mn.x - _activeMin.x) * inv),
@@ -610,12 +694,11 @@ public sealed class VoxelTracerSystem : MonoBehaviour
                 Vector3 b = l2w.MultiplyPoint3x4(_tmpVerts[i1]);
                 Vector3 c = l2w.MultiplyPoint3x4(_tmpVerts[i2]);
 
-                Vector3 n = Vector3.Cross(b - a, c - a);
-                float len2 = n.sqrMagnitude;
-                if (len2 < 1e-20f) continue;
-                n /= Mathf.Sqrt(len2);
+                // Degenerate triangle check (no sqrt needed — just check cross product magnitude)
+                Vector3 cross = Vector3.Cross(b - a, c - a);
+                if (cross.sqrMagnitude < 1e-20f) continue;
 
-                target.Add(new Tri { a = a, b = b, c = c, n = n });
+                target.Add(new Tri { a = a, b = b, c = c });
             }
         }
     }
@@ -727,11 +810,9 @@ public sealed class VoxelTracerSystem : MonoBehaviour
 
     void AddTri(Vector3 a, Vector3 b, Vector3 c, List<Tri> target)
     {
-        Vector3 n = Vector3.Cross(b - a, c - a);
-        float len2 = n.sqrMagnitude;
-        if (len2 < 1e-20f) return;
-        n /= Mathf.Sqrt(len2);
-        target.Add(new Tri { a = a, b = b, c = c, n = n });
+        Vector3 cross = Vector3.Cross(b - a, c - a);
+        if (cross.sqrMagnitude < 1e-20f) return;
+        target.Add(new Tri { a = a, b = b, c = c });
     }
 
     // ================================================================
@@ -808,10 +889,11 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         KSweepFill = coreCS.FindKernel("SweepFill");
         KBuildTexture = coreCS.FindKernel("BuildTexture");
         KComputeNormals = coreCS.FindKernel("ComputeNormals");
-        KCopyStaticToWorking = coreCS.FindKernel("CopyStaticToWorking");
-        KClearFlood = coreCS.FindKernel("ClearFlood");
         KBlurFill = coreCS.FindKernel("BlurFill");
         KCopyAndClearFlood = coreCS.FindKernel("CopyAndClearFlood");
+        KCopyAndClearFloodLinear = coreCS.FindKernel("CopyAndClearFloodLinear");
+        KRestoreStaticFull = coreCS.FindKernel("RestoreStaticFull");
+        KRestoreStaticFullLinear = coreCS.FindKernel("RestoreStaticFullLinear");
         KClearVoxelBuffer = coreCS.FindKernel("ClearVoxelBuffer");
         KCopyWorkingToStatic = coreCS.FindKernel("CopyWorkingToStatic");
         _kernelsCached = true;
@@ -825,7 +907,6 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         int totalVoxels = gx * gy * gz;
         _totalVoxels = totalVoxels;
         _voxelBuffer = new ComputeBuffer(totalVoxels, sizeof(uint));
-        _floodBuffer = new ComputeBuffer(totalVoxels, sizeof(uint));
         _staticVoxelBuf = new ComputeBuffer(totalVoxels, sizeof(uint));
 
         _fillTex = new RenderTexture(gx, gy, 0, RenderTextureFormat.RFloat)
@@ -840,29 +921,33 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         };
         _fillTex.Create();
 
-        _blurredFillTex = new RenderTexture(gx, gy, 0, RenderTextureFormat.RFloat)
+        // Normals textures: only allocate when computeNormals is enabled
+        if (computeNormals)
         {
-            dimension = UnityEngine.Rendering.TextureDimension.Tex3D,
-            volumeDepth = gz,
-            enableRandomWrite = true,
-            useMipMap = false,
-            autoGenerateMips = false,
-            wrapMode = TextureWrapMode.Clamp,
-            filterMode = FilterMode.Point
-        };
-        _blurredFillTex.Create();
+            _blurredFillTex = new RenderTexture(gx, gy, 0, RenderTextureFormat.RFloat)
+            {
+                dimension = UnityEngine.Rendering.TextureDimension.Tex3D,
+                volumeDepth = gz,
+                enableRandomWrite = true,
+                useMipMap = false,
+                autoGenerateMips = false,
+                wrapMode = TextureWrapMode.Clamp,
+                filterMode = FilterMode.Point
+            };
+            _blurredFillTex.Create();
 
-        _normalsTex = new RenderTexture(gx, gy, 0, RenderTextureFormat.ARGBFloat)
-        {
-            dimension = UnityEngine.Rendering.TextureDimension.Tex3D,
-            volumeDepth = gz,
-            enableRandomWrite = true,
-            useMipMap = false,
-            autoGenerateMips = false,
-            wrapMode = TextureWrapMode.Clamp,
-            filterMode = FilterMode.Bilinear
-        };
-        _normalsTex.Create();
+            _normalsTex = new RenderTexture(gx, gy, 0, RenderTextureFormat.ARGBFloat)
+            {
+                dimension = UnityEngine.Rendering.TextureDimension.Tex3D,
+                volumeDepth = gz,
+                enableRandomWrite = true,
+                useMipMap = false,
+                autoGenerateMips = false,
+                wrapMode = TextureWrapMode.Clamp,
+                filterMode = FilterMode.Bilinear
+            };
+            _normalsTex.Create();
+        }
     }
 
     void UploadStaticTriangles()
@@ -899,7 +984,6 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     void ReleaseBuffers()
     {
         if (_voxelBuffer != null) { _voxelBuffer.Release(); _voxelBuffer = null; }
-        if (_floodBuffer != null) { _floodBuffer.Release(); _floodBuffer = null; }
         if (_staticVoxelBuf != null) { _staticVoxelBuf.Release(); _staticVoxelBuf = null; }
     }
 
