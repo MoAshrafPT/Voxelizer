@@ -228,7 +228,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 800167331}
-  m_Enabled: 0
+  m_Enabled: 1
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 0755434ddbf74e942bedf1de802ccd39, type: 3}
   m_Name: 
@@ -368,7 +368,7 @@ MonoBehaviour:
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 987774555}
-  m_Enabled: 1
+  m_Enabled: 0
   m_EditorHideFlags: 0
   m_Script: {fileID: 11500000, guid: 4ca2acbb03c1a08439fd35842cc07253, type: 3}
   m_Name: 
@@ -566,7 +566,7 @@ MonoBehaviour:
   boundsMode: 1
   gridMin: {x: -10, y: -10, z: -10}
   gridMax: {x: 10, y: 10, z: 10}
-  voxelSize: 0.1
+  voxelSize: 0.07
   autoFitPadding: 1
   fillVolume: 1
   fillSweepRounds: 2
@@ -574,8 +574,8 @@ MonoBehaviour:
   includeMeshRenderers: 1
   includeSkinnedMeshRenderers: 1
   includeTerrains: 1
-  terrainSampleStep: 4
-  maxVoxelsPerAxis: 256
+  terrainSampleStep: 1
+  maxVoxelsPerAxis: 512
   maxVoxelCountMillions: 32
 --- !u!4 &1603268499
 Transform:
@@ -880,7 +880,7 @@ Transform:
   m_GameObject: {fileID: 2043068036}
   serializedVersion: 2
   m_LocalRotation: {x: 0.14954238, y: 0.11534057, z: -0.017567186, w: 0.98184776}
-  m_LocalPosition: {x: 2.11, y: 0.5, z: -1.56}
+  m_LocalPosition: {x: 0.01, y: 0.27, z: -1.98}
   m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 0
   m_Children: []
