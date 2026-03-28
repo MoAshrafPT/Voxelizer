@@ -19,6 +19,7 @@
 #pragma kernel RestoreStaticFullLinear
 #pragma kernel ClearVoxelBuffer
 #pragma kernel CopyWorkingToStatic
+#pragma kernel WriteMaterialProperties
 
 // ---- Grid ----
 int _Width, _Height, _Depth;
@@ -369,4 +370,67 @@ void CopyWorkingToStatic(uint3 id : SV_DispatchThreadID)
     if (p.x >= _Width || p.y >= _Height || p.z >= _Depth) return;
     int idx = VoxelIndex(p.x, p.y, p.z);
     _DstBuffer[idx] = _VoxelBuffer[idx];
+}
+
+// ========================= Material Properties =========================
+
+// GPU struct matching C# MaterialSource (StructLayout.Sequential)
+struct MaterialSource
+{
+    float3 position;  // world-space center
+    float3 extents;   // half-size for AABB, or (radius, radius, radius) for sphere
+    float  temperature;
+    float  phase;     // 0 = solid, 1 = fluid
+    uint   shape;     // 0 = AABB, 1 = sphere
+};
+
+StructuredBuffer<MaterialSource> _MaterialSources;
+int _MaterialSourceCount;
+float _DefaultSolidTemperature;
+
+RWTexture3D<float> _TemperatureTex;
+RWTexture3D<float> _PhaseTex;
+
+// 11: Write material properties (temperature, phase) into 3D textures.
+// Reads the fill texture to know which voxels are solid.
+// Then stamps heat sources, water bodies, and fluid sources on top.
+[numthreads(8, 8, 8)]
+void WriteMaterialProperties(uint3 id : SV_DispatchThreadID)
+{
+    int3 p = int3(_RegionMinX, _RegionMinY, _RegionMinZ) + (int3)id;
+    if (p.x >= _Width || p.y >= _Height || p.z >= _Depth) return;
+
+    float fill = _FillTex[p];
+    float3 worldPos = VoxelCenter(p.x, p.y, p.z);
+
+    // Default: empty voxels get 0, filled solids get default temperature
+    float temp  = fill > 0.5 ? _DefaultSolidTemperature : 0.0;
+    float phase = 0.0; // 0 = solid (or empty)
+
+    // Stamp sources — later sources override earlier ones
+    for (int i = 0; i < _MaterialSourceCount; i++)
+    {
+        MaterialSource src = _MaterialSources[i];
+        bool inside = false;
+
+        if (src.shape == 0u) // AABB
+        {
+            float3 d = abs(worldPos - src.position);
+            inside = (d.x <= src.extents.x) && (d.y <= src.extents.y) && (d.z <= src.extents.z);
+        }
+        else // sphere
+        {
+            float3 d = worldPos - src.position;
+            inside = dot(d, d) <= (src.extents.x * src.extents.x);
+        }
+
+        if (inside)
+        {
+            temp  = src.temperature;
+            phase = src.phase;
+        }
+    }
+
+    _TemperatureTex[p] = temp;
+    _PhaseTex[p]       = phase;
 }

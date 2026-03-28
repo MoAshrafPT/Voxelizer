@@ -44,6 +44,10 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     public bool includeTerrains = true;
     [Range(1, 32)] public int terrainSampleStep = 4;
 
+    [Header("Material Properties")]
+    [Tooltip("Default temperature for filled solid voxels (ambient)")]
+    public float defaultSolidTemperature = 25f;
+
     [Header("Safety")]
     [Range(32, 512)] public int maxVoxelsPerAxis = 256;
     [Min(1)] public float maxVoxelCountMillions = 32f;
@@ -66,18 +70,38 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         public Vector3Int min, max;
     }
 
+    /// <summary>GPU-side material source stamp. Matches compute shader struct.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    struct MaterialSource
+    {
+        public Vector3 position;   // world-space center
+        public Vector3 extents;    // half-size (AABB) or (radius,radius,radius) for sphere
+        public float temperature;
+        public float phase;      // 0 = solid, 1 = fluid
+        public uint shape;      // 0 = AABB, 1 = sphere
+    }
+
     // ================================================================
     // Public accessors for the camera
     // ================================================================
 
     public RenderTexture FillTexture => _fillTex;
     public RenderTexture NormalsTexture => _normalsTex;
+    public RenderTexture TemperatureTexture => _temperatureTex;
+    public RenderTexture PhaseTexture => _phaseTex;
     public int Nx => _nx;
     public int Ny => _ny;
     public int Nz => _nz;
     public Vector3 ActiveGridMin => _activeMin;
     public float ActiveVoxelSize => voxelSize;
     public bool IsReady => _fillTex != null && _nx > 0;
+
+    /// <summary>Read-only access to registered heat sources (for external sim module).</summary>
+    public static IReadOnlyCollection<VoxelHeatSource> HeatSources => _registeredHeatSources;
+    /// <summary>Read-only access to registered fluid sources (for external sim module).</summary>
+    public static IReadOnlyCollection<VoxelFluidSource> FluidSources => _registeredFluidSources;
+    /// <summary>Read-only access to registered water bodies (for external sim module).</summary>
+    public static IReadOnlyCollection<VoxelWaterBody> WaterBodies => _registeredWaterBodies;
 
     // ================================================================
     // Private state
@@ -89,6 +113,7 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     int KCopyAndClearFlood, KCopyAndClearFloodLinear;
     int KRestoreStaticFull, KRestoreStaticFullLinear;
     int KClearVoxelBuffer, KCopyWorkingToStatic;
+    int KWriteMaterialProperties;
     bool _kernelsCached;
 
     // GPU buffers
@@ -103,6 +128,12 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     RenderTexture _fillTex;
     RenderTexture _blurredFillTex;
     RenderTexture _normalsTex;
+    RenderTexture _temperatureTex;
+    RenderTexture _phaseTex;
+
+    // Material source GPU buffer
+    ComputeBuffer _materialSourceBuffer;
+    readonly List<MaterialSource> _materialSourceList = new List<MaterialSource>(64);
 
     // Grid state
     int _nx, _ny, _nz;
@@ -121,11 +152,20 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     // Registration-based object tracking (avoids FindObjectsByType per frame)
     static readonly HashSet<VoxelDynamic> _registeredDynamics = new HashSet<VoxelDynamic>();
     static readonly HashSet<SkinnedMeshRenderer> _registeredSkins = new HashSet<SkinnedMeshRenderer>();
+    static readonly HashSet<VoxelHeatSource> _registeredHeatSources = new HashSet<VoxelHeatSource>();
+    static readonly HashSet<VoxelFluidSource> _registeredFluidSources = new HashSet<VoxelFluidSource>();
+    static readonly HashSet<VoxelWaterBody> _registeredWaterBodies = new HashSet<VoxelWaterBody>();
 
     public static void RegisterDynamic(VoxelDynamic vd) { if (vd != null) _registeredDynamics.Add(vd); }
     public static void UnregisterDynamic(VoxelDynamic vd) { _registeredDynamics.Remove(vd); }
     public static void RegisterSkin(SkinnedMeshRenderer smr) { if (smr != null) _registeredSkins.Add(smr); }
     public static void UnregisterSkin(SkinnedMeshRenderer smr) { _registeredSkins.Remove(smr); }
+    public static void RegisterHeatSource(VoxelHeatSource hs) { if (hs != null) _registeredHeatSources.Add(hs); }
+    public static void UnregisterHeatSource(VoxelHeatSource hs) { _registeredHeatSources.Remove(hs); }
+    public static void RegisterFluidSource(VoxelFluidSource fs) { if (fs != null) _registeredFluidSources.Add(fs); }
+    public static void UnregisterFluidSource(VoxelFluidSource fs) { _registeredFluidSources.Remove(fs); }
+    public static void RegisterWaterBody(VoxelWaterBody wb) { if (wb != null) _registeredWaterBodies.Add(wb); }
+    public static void UnregisterWaterBody(VoxelWaterBody wb) { _registeredWaterBodies.Remove(wb); }
 
     // Dirty flags
     bool _staticDirty = true;      // rebuild static tris + re-voxelize static layer
@@ -519,6 +559,9 @@ public sealed class VoxelTracerSystem : MonoBehaviour
             coreCS.SetTexture(KComputeNormals, "_NormalTex", _normalsTex);
             Dispatch3D(KComputeNormals, blurSize.x, blurSize.y, blurSize.z);
         }
+
+        // Write material properties (temperature, phase) after fill is known
+        StampMaterialProperties(gx, gy, gz, regMin, regMax);
     }
 
     void SetGridUniforms(int gx, int gy, int gz)
@@ -896,6 +939,7 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         KRestoreStaticFullLinear = coreCS.FindKernel("RestoreStaticFullLinear");
         KClearVoxelBuffer = coreCS.FindKernel("ClearVoxelBuffer");
         KCopyWorkingToStatic = coreCS.FindKernel("CopyWorkingToStatic");
+        KWriteMaterialProperties = coreCS.FindKernel("WriteMaterialProperties");
         _kernelsCached = true;
     }
 
@@ -920,6 +964,31 @@ public sealed class VoxelTracerSystem : MonoBehaviour
             filterMode = FilterMode.Point
         };
         _fillTex.Create();
+
+        // Material property textures — always allocated (used by external sim module)
+        _temperatureTex = new RenderTexture(gx, gy, 0, RenderTextureFormat.RFloat)
+        {
+            dimension = UnityEngine.Rendering.TextureDimension.Tex3D,
+            volumeDepth = gz,
+            enableRandomWrite = true,
+            useMipMap = false,
+            autoGenerateMips = false,
+            wrapMode = TextureWrapMode.Clamp,
+            filterMode = FilterMode.Point
+        };
+        _temperatureTex.Create();
+
+        _phaseTex = new RenderTexture(gx, gy, 0, RenderTextureFormat.RFloat)
+        {
+            dimension = UnityEngine.Rendering.TextureDimension.Tex3D,
+            volumeDepth = gz,
+            enableRandomWrite = true,
+            useMipMap = false,
+            autoGenerateMips = false,
+            wrapMode = TextureWrapMode.Clamp,
+            filterMode = FilterMode.Point
+        };
+        _phaseTex.Create();
 
         // Normals textures: only allocate when computeNormals is enabled
         if (computeNormals)
@@ -992,6 +1061,8 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         if (_fillTex != null) { _fillTex.Release(); Destroy(_fillTex); _fillTex = null; }
         if (_blurredFillTex != null) { _blurredFillTex.Release(); Destroy(_blurredFillTex); _blurredFillTex = null; }
         if (_normalsTex != null) { _normalsTex.Release(); Destroy(_normalsTex); _normalsTex = null; }
+        if (_temperatureTex != null) { _temperatureTex.Release(); Destroy(_temperatureTex); _temperatureTex = null; }
+        if (_phaseTex != null) { _phaseTex.Release(); Destroy(_phaseTex); _phaseTex = null; }
     }
 
     void ReleaseTriBuffers()
@@ -1007,7 +1078,131 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         ReleaseBuffers();
         ReleaseTextures();
         ReleaseTriBuffers();
+        if (_materialSourceBuffer != null) { _materialSourceBuffer.Release(); _materialSourceBuffer = null; }
         if (_bakedMesh != null) { Destroy(_bakedMesh); _bakedMesh = null; }
+    }
+
+    // ================================================================
+    // Material property stamping
+    // ================================================================
+
+    /// <summary>Build the material source list from registered heat sources,
+    /// fluid sources, and water bodies, then dispatch the GPU stamp kernel.</summary>
+    void StampMaterialProperties(int gx, int gy, int gz, Vector3Int regMin, Vector3Int regMax)
+    {
+        if (_temperatureTex == null || _phaseTex == null) return;
+
+        BuildMaterialSourceList();
+        UploadMaterialSources();
+
+        Vector3Int regSize = regMax - regMin + Vector3Int.one;
+        SetRegionMin(regMin.x, regMin.y, regMin.z);
+
+        coreCS.SetFloat("_DefaultSolidTemperature", defaultSolidTemperature);
+        coreCS.SetInt("_MaterialSourceCount", _materialSourceList.Count);
+        coreCS.SetTexture(KWriteMaterialProperties, "_FillTex", _fillTex);
+        coreCS.SetTexture(KWriteMaterialProperties, "_TemperatureTex", _temperatureTex);
+        coreCS.SetTexture(KWriteMaterialProperties, "_PhaseTex", _phaseTex);
+        if (_materialSourceBuffer != null)
+            coreCS.SetBuffer(KWriteMaterialProperties, "_MaterialSources", _materialSourceBuffer);
+
+        Dispatch3D(KWriteMaterialProperties, regSize.x, regSize.y, regSize.z);
+    }
+
+    void BuildMaterialSourceList()
+    {
+        _materialSourceList.Clear();
+
+        // Heat sources: mark voxels as solid with specified temperature
+        foreach (var hs in _registeredHeatSources)
+        {
+            if (hs == null || !hs.isActiveAndEnabled) continue;
+
+            if (hs.radius > 0f)
+            {
+                _materialSourceList.Add(new MaterialSource
+                {
+                    position = hs.transform.position,
+                    extents = Vector3.one * hs.radius,
+                    temperature = hs.temperature,
+                    phase = 0f, // solid
+                    shape = 1   // sphere
+                });
+            }
+            else
+            {
+                var r = hs.GetComponent<Renderer>();
+                if (r != null)
+                {
+                    _materialSourceList.Add(new MaterialSource
+                    {
+                        position = r.bounds.center,
+                        extents = r.bounds.extents,
+                        temperature = hs.temperature,
+                        phase = 0f, // solid
+                        shape = 0   // AABB
+                    });
+                }
+                else
+                {
+                    _materialSourceList.Add(new MaterialSource
+                    {
+                        position = hs.transform.position,
+                        extents = Vector3.one * 0.5f,
+                        temperature = hs.temperature,
+                        phase = 0f,
+                        shape = 1
+                    });
+                }
+            }
+        }
+
+        // Water bodies: AABB volumes marked as fluid
+        foreach (var wb in _registeredWaterBodies)
+        {
+            if (wb == null || !wb.isActiveAndEnabled) continue;
+            _materialSourceList.Add(new MaterialSource
+            {
+                position = wb.transform.position,
+                extents = wb.size * 0.5f,
+                temperature = wb.initialTemperature,
+                phase = 1f, // fluid
+                shape = 0   // AABB
+            });
+        }
+
+        // Fluid sources: spherical emission volumes marked as fluid
+        foreach (var fs in _registeredFluidSources)
+        {
+            if (fs == null || !fs.isActiveAndEnabled) continue;
+            _materialSourceList.Add(new MaterialSource
+            {
+                position = fs.transform.position,
+                extents = Vector3.one * fs.emissionRadius,
+                temperature = fs.initialTemperature,
+                phase = 1f, // fluid
+                shape = 1   // sphere
+            });
+        }
+    }
+
+    void UploadMaterialSources()
+    {
+        int count = _materialSourceList.Count;
+        if (count == 0)
+        {
+            // Need at least a 1-element buffer to bind (GPU requires valid buffer)
+            if (_materialSourceBuffer == null)
+                _materialSourceBuffer = new ComputeBuffer(1, Marshal.SizeOf(typeof(MaterialSource)));
+            return;
+        }
+
+        if (_materialSourceBuffer != null && _materialSourceBuffer.count < count)
+        { _materialSourceBuffer.Release(); _materialSourceBuffer = null; }
+        if (_materialSourceBuffer == null)
+            _materialSourceBuffer = new ComputeBuffer(count, Marshal.SizeOf(typeof(MaterialSource)));
+
+        _materialSourceBuffer.SetData(_materialSourceList);
     }
 
     // ================================================================
