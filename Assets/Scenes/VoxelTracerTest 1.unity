@@ -246,6 +246,77 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 936650645ccee63498a91baf801762fa, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+--- !u!1 &864310115
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 864310117}
+  - component: {fileID: 864310116}
+  - component: {fileID: 864310118}
+  m_Layer: 0
+  m_Name: GameObject
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &864310116
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 864310115}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: c3d4e5f6a7b849c0d1e2f3a4b5c6d7e8, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  size: {x: 4, y: 2, z: 4}
+  initialTemperature: 25
+--- !u!4 &864310117
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 864310115}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 2.199, y: 0.51, z: -0.25917333}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &864310118
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 864310115}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d8e5c714d78c716429ecd41485fd2392, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  restDensity: 60
+  gasStiffness: 10
+  viscosity: 15
+  smoothingRadius: 0.5
+  particleMass: 1
+  damping: 0.998
+  temperature: 25
+  thermalDiffusivity: 0.1
+  ambientTemperature: 25
+  coolingRate: 0.01
+  gravity: {x: 0, y: -9.81, z: 0}
+  phase: 1
 --- !u!1 &987774555
 GameObject:
   m_ObjectHideFlags: 0
@@ -575,6 +646,7 @@ MonoBehaviour:
   includeSkinnedMeshRenderers: 1
   includeTerrains: 1
   terrainSampleStep: 1
+  defaultSolidTemperature: 25
   maxVoxelsPerAxis: 512
   maxVoxelCountMillions: 32
 --- !u!4 &1603268499
@@ -793,6 +865,9 @@ GameObject:
   - component: {fileID: 2043068037}
   - component: {fileID: 2043068041}
   - component: {fileID: 2043068042}
+  - component: {fileID: 2043068043}
+  - component: {fileID: 2043068044}
+  - component: {fileID: 2043068045}
   m_Layer: 0
   m_Name: Cube
   m_TagString: Untagged
@@ -911,6 +986,56 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 936650645ccee63498a91baf801762fa, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+--- !u!114 &2043068043
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2043068036}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a1b2c3d4e5f647a8b9c0d1e2f3a4b5c6, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  temperature: 500
+  radius: 2
+  active: 1
+--- !u!114 &2043068044
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2043068036}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b2c3d4e5f6a748b9c0d1e2f3a4b5c6d7, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  initialTemperature: 25
+  emissionRadius: 1
+  emissionRate: 100
+  emissionDirection: {x: 0, y: -1, z: 0}
+  emissionSpeed: 2
+--- !u!114 &2043068045
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2043068036}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 7193c26c385088b48869367ff217e876, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  temperature: 25
+  thermalDiffusivity: 0.1
+  coolingRate: 0.01
+  density: 2500
+  mass: 0
+  phase: 0
 --- !u!1 &2099608179 stripped
 GameObject:
   m_CorrespondingSourceObject: {fileID: 8164078558771037576, guid: 4248e863a51f9c44288adf7b6debd4d1, type: 3}
@@ -939,3 +1064,4 @@ SceneRoots:
   - {fileID: 1317242629}
   - {fileID: 327714658}
   - {fileID: 1670059770}
+  - {fileID: 864310117}

@@ -102,6 +102,10 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     public static IReadOnlyCollection<VoxelFluidSource> FluidSources => _registeredFluidSources;
     /// <summary>Read-only access to registered water bodies (for external sim module).</summary>
     public static IReadOnlyCollection<VoxelWaterBody> WaterBodies => _registeredWaterBodies;
+    /// <summary>Read-only access to registered solid material properties (for external sim module).</summary>
+    public static IReadOnlyCollection<VoxelSolidMaterial> SolidMaterials => _registeredSolidMaterials;
+    /// <summary>Read-only access to registered fluid material properties (for external sim module).</summary>
+    public static IReadOnlyCollection<VoxelFluidMaterial> FluidMaterials => _registeredFluidMaterials;
 
     // ================================================================
     // Private state
@@ -155,6 +159,8 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     static readonly HashSet<VoxelHeatSource> _registeredHeatSources = new HashSet<VoxelHeatSource>();
     static readonly HashSet<VoxelFluidSource> _registeredFluidSources = new HashSet<VoxelFluidSource>();
     static readonly HashSet<VoxelWaterBody> _registeredWaterBodies = new HashSet<VoxelWaterBody>();
+    static readonly HashSet<VoxelSolidMaterial> _registeredSolidMaterials = new HashSet<VoxelSolidMaterial>();
+    static readonly HashSet<VoxelFluidMaterial> _registeredFluidMaterials = new HashSet<VoxelFluidMaterial>();
 
     public static void RegisterDynamic(VoxelDynamic vd) { if (vd != null) _registeredDynamics.Add(vd); }
     public static void UnregisterDynamic(VoxelDynamic vd) { _registeredDynamics.Remove(vd); }
@@ -166,6 +172,10 @@ public sealed class VoxelTracerSystem : MonoBehaviour
     public static void UnregisterFluidSource(VoxelFluidSource fs) { _registeredFluidSources.Remove(fs); }
     public static void RegisterWaterBody(VoxelWaterBody wb) { if (wb != null) _registeredWaterBodies.Add(wb); }
     public static void UnregisterWaterBody(VoxelWaterBody wb) { _registeredWaterBodies.Remove(wb); }
+    public static void RegisterSolidMaterial(VoxelSolidMaterial sm) { if (sm != null) _registeredSolidMaterials.Add(sm); }
+    public static void UnregisterSolidMaterial(VoxelSolidMaterial sm) { _registeredSolidMaterials.Remove(sm); }
+    public static void RegisterFluidMaterial(VoxelFluidMaterial fm) { if (fm != null) _registeredFluidMaterials.Add(fm); }
+    public static void UnregisterFluidMaterial(VoxelFluidMaterial fm) { _registeredFluidMaterials.Remove(fm); }
 
     // Dirty flags
     bool _staticDirty = true;      // rebuild static tris + re-voxelize static layer
@@ -1116,7 +1126,7 @@ public sealed class VoxelTracerSystem : MonoBehaviour
         // Heat sources: mark voxels as solid with specified temperature
         foreach (var hs in _registeredHeatSources)
         {
-            if (hs == null || !hs.isActiveAndEnabled) continue;
+            if (hs == null || !hs.isActiveAndEnabled || !hs.active) continue;
 
             if (hs.radius > 0f)
             {
@@ -1157,30 +1167,67 @@ public sealed class VoxelTracerSystem : MonoBehaviour
             }
         }
 
+        // Solid materials: stamp temperature from VoxelSolidMaterial onto renderer bounds
+        foreach (var sm in _registeredSolidMaterials)
+        {
+            if (sm == null || !sm.isActiveAndEnabled) continue;
+            var r = sm.GetComponent<Renderer>();
+            if (r != null)
+            {
+                _materialSourceList.Add(new MaterialSource
+                {
+                    position = r.bounds.center,
+                    extents = r.bounds.extents,
+                    temperature = sm.temperature,
+                    phase = 0f, // solid
+                    shape = 0   // AABB
+                });
+            }
+            else
+            {
+                _materialSourceList.Add(new MaterialSource
+                {
+                    position = sm.transform.position,
+                    extents = Vector3.one * 0.5f,
+                    temperature = sm.temperature,
+                    phase = 0f,
+                    shape = 1
+                });
+            }
+        }
+
         // Water bodies: AABB volumes marked as fluid
+        // Use VoxelFluidMaterial temperature if attached, otherwise fallback to initialTemperature
         foreach (var wb in _registeredWaterBodies)
         {
             if (wb == null || !wb.isActiveAndEnabled) continue;
+            var fm = wb.GetComponent<VoxelFluidMaterial>();
+            float temp = fm != null ? fm.temperature : wb.initialTemperature;
+            float phase = fm != null ? (float)fm.phase : 1f;
             _materialSourceList.Add(new MaterialSource
             {
                 position = wb.transform.position,
                 extents = wb.size * 0.5f,
-                temperature = wb.initialTemperature,
-                phase = 1f, // fluid
+                temperature = temp,
+                phase = phase,
                 shape = 0   // AABB
             });
         }
 
         // Fluid sources: spherical emission volumes marked as fluid
+        // Use VoxelFluidMaterial temperature if attached, otherwise fallback to initialTemperature
         foreach (var fs in _registeredFluidSources)
         {
             if (fs == null || !fs.isActiveAndEnabled) continue;
+            var fm = fs.GetComponent<VoxelFluidMaterial>();
+            float temp = fm != null ? fm.temperature : fs.initialTemperature;
+            float phase = fm != null ? (float)fm.phase : 1f;
             _materialSourceList.Add(new MaterialSource
             {
                 position = fs.transform.position,
                 extents = Vector3.one * fs.emissionRadius,
-                temperature = fs.initialTemperature,
-                phase = 1f, // fluid
+                temperature = temp,
+                phase = phase,
                 shape = 1   // sphere
             });
         }

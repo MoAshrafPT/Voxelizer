@@ -13,6 +13,10 @@ public sealed class VoxelHeatSource : MonoBehaviour
     [Tooltip("Radius of effect in world units. 0 = use renderer bounds.")]
     [Min(0)] public float radius = 0f;
 
+    [Tooltip("Whether this heat source is currently active. " +
+             "Maps to the 'active' field in the HeatSource struct.")]
+    public bool active = true;
+
     void OnEnable() => VoxelTracerSystem.RegisterHeatSource(this);
     void OnDisable() => VoxelTracerSystem.UnregisterHeatSource(this);
 
